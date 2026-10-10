@@ -1,0 +1,22 @@
+# Local profiles and deployment state
+config.json
+config.*.json
+!config.example.json
+*.local.json
+profiles/
+runtime/
+*.log
+.history-sync-backups/
+*.sqlite
+*.sqlite-*
+*.jsonl
+auth.json
+# Build and interpreter artifacts
+__pycache__/
+*.py[cod]
+.venv/
+releases/
+*.zip
+*.zip.sha256
+SHA256SUMS
+SHA256SUMS.txt

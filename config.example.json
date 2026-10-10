@@ -1,0 +1,16 @@
+{
+  "windows_home": "%USERPROFILE%\\.codex",
+  "wsl_distro": "Ubuntu",
+  "wsl_user": "your-linux-user",
+  "wsl_home": "/home/your-linux-user/.codex",
+  "python_windows": "auto",
+  "python_wsl": "/usr/bin/python3",
+  "runtime_directory": "runtime/CodexHistorySync-Public",
+  "task_name": "CodexHistorySync-Public",
+  "interval_minutes": 5,
+  "quiet_seconds": 60,
+  "max_transfers_per_run": 10,
+  "run_budget_seconds": 120,
+  "operation_timeout_seconds": 120,
+  "task_time_limit_minutes": 10
+}
