@@ -20,7 +20,7 @@ import tempfile
 import time
 
 VERSION = 1
-SOFTWARE_VERSION = '2.0.0'
+SOFTWARE_VERSION = '2.0.1'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -133,7 +133,8 @@ def decode_output(raw):
 
 
 def wsl_running(distro):
-    result = subprocess.run(['wsl.exe', '--list', '--running', '--quiet'], capture_output=True, timeout=15)
+    result = subprocess.run(['wsl.exe', '--list', '--running', '--quiet'], capture_output=True, timeout=15,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     if result.returncode:
         raise RuntimeError('Cannot query running WSL distributions')
     return distro in [line.replace('\x00', '').strip() for line in decode_output(result.stdout).splitlines()]
@@ -160,7 +161,8 @@ class Endpoints:
                 raise RuntimeError('WSL stopped during this run; deferred until the next run')
             cmd = ['wsl.exe', '--distribution', self.config['wsl_distro'], '--user', self.config['wsl_user'], '--exec', self.config.get('python_wsl', '/usr/bin/python3'), linux_mount_path(self.script), operation, '--home', self.config['wsl_home']]
         cmd += ['--quiet-seconds', str(self.config.get('quiet_seconds', 60)), *map(str, args)]
-        result = subprocess.run(cmd, capture_output=True, timeout=self.config.get('operation_timeout_seconds', 120))
+        result = subprocess.run(cmd, capture_output=True, timeout=self.config.get('operation_timeout_seconds', 120),
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         try:
             value = json.loads(decode_output(result.stdout))
         except (json.JSONDecodeError, UnicodeError):
