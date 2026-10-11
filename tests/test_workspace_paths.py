@@ -112,7 +112,7 @@ class WorkspaceImportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="workspace-path-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source = fixture(self.root / "source")
         self.target = fixture(self.root / "target", with_chat=False, extra_column=True)
         self.package = self.root / "package"
@@ -511,7 +511,7 @@ class ImportPreflightCoordinatorTests(unittest.TestCase):
                     "metadata_revision": "metadata", "quiet_seconds": 7200, "active": False,
                     "item_count": 1, "turn_count": 1}
         with tempfile.TemporaryDirectory(prefix="workspace-preflight-controller-") as temporary:
-            runtime = Path(temporary)
+            runtime = Path(temporary).resolve()
             (runtime / "ledger.json").write_text(json.dumps({"version": sync.VERSION, "threads": {}}), encoding="utf-8")
             endpoint = mock.MagicMock()
             windows = {"threads": [record(ID, "bad-original"), record(valid_id, "valid-original")], "skipped": [], "backend_running": False}
@@ -553,7 +553,7 @@ class RepairControllerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="workspace-repair-controller-")
         self.addCleanup(self.temporary.cleanup)
-        self.runtime = Path(self.temporary.name)
+        self.runtime = Path(self.temporary.name).resolve()
         self.windows = self.record("windows-original", "windows-body")
         self.wsl = self.record("wsl-original", "wsl-body")
         self.repaired = self.record("wsl-repaired", "wsl-mapped-body")

@@ -30,7 +30,7 @@ class ConfigurationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='public-config-test-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.profile = self.root / 'profiles' / 'first.json'
 
     def test_default_runtime_is_relative_to_profile_not_program_directory(self):
@@ -154,7 +154,7 @@ class ProfileEntryPointTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='public-main-test-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
 
     def invoke(self, profile, *arguments):
         output = io.StringIO()

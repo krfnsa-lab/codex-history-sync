@@ -18,7 +18,7 @@ SPEC.loader.exec_module(endpoint)
 class FingerprintReview(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='endpoint-review-')
-        self.home = Path(self.directory.name)
+        self.home = Path(self.directory.name).resolve()
         self.transcript = self.home / 'sessions' / 'chat-1.jsonl'
         self.transcript.parent.mkdir()
         self.transcript.write_bytes(b'original\n')

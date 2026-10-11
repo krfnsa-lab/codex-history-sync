@@ -1,6 +1,7 @@
 """Isolated tests: no real Codex home is modified."""
 import argparse
 import copy
+import ctypes
 import importlib.util
 import json
 import os
@@ -19,6 +20,7 @@ ID = "00000000-0000-4000-8000-000000000001"
 
 
 def fixture(root, with_chat=True, extra_column=False, item_text="source text"):
+    root = root.resolve()
     root.mkdir(parents=True)
     (root / "config.toml").write_text("protected-config\n")
     (root / "auth.json").write_text("protected-auth\n")
@@ -62,7 +64,7 @@ class EndpointTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='history-endpoint-test-')
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source = fixture(self.root / "source", extra_column=False)
         self.target = fixture(self.root / "target", with_chat=False, extra_column=True)
         self.package = self.root / "package"
@@ -80,6 +82,24 @@ class EndpointTests(unittest.TestCase):
     def imported(self):
         self.export()
         return ep.import_chat(self.args(home=str(self.target), expected="absent"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows short paths require a native Windows filesystem")
+    def test_windows_short_home_alias_uses_canonical_native_paths(self):
+        # GitHub's Windows runner exposes TEMP through an 8.3 user-directory
+        # alias. The public endpoint must accept that alias via native_home,
+        # while internal fixtures use the same canonical path as the CLI.
+        get_short_path = ctypes.windll.kernel32.GetShortPathNameW
+        get_short_path.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        get_short_path.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_short_path(str(self.source), buffer, len(buffer))
+        if not length or length >= len(buffer) or Path(buffer.value) == self.source:
+            self.skipTest("An alternate Windows short path is not available on this filesystem")
+        native = ep.native_home(buffer.value)
+        self.assertEqual(native, self.source)
+        original = ep.read_revision(self.source, ID)
+        result = ep.export_chat(self.args(home=buffer.value, expected=original["revision"]))
+        self.assertEqual(result["revision"], original["revision"])
 
     def test_new_chat_cross_schema_and_native_settings(self):
         source_revision = ep.read_revision(self.source, ID)

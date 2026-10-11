@@ -223,7 +223,7 @@ class PlannerReview(unittest.TestCase):
         endpoint = importlib.util.module_from_spec(endpoint_spec)
         endpoint_spec.loader.exec_module(endpoint)
         with tempfile.TemporaryDirectory(prefix='actual-payload-') as directory:
-            home = Path(directory)
+            home = Path(directory).resolve()
             transcript = home / 'sessions' / 'new.jsonl'
             transcript.parent.mkdir()
             transcript.write_bytes(b'')
@@ -329,7 +329,7 @@ class RunningDistributionReview(unittest.TestCase):
 class CoordinatorCheckpointReview(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='sync-review-')
-        self.runtime = Path(self.directory.name)
+        self.runtime = Path(self.directory.name).resolve()
         self.windows, self.wsl = view(row(body='new-source')), view(row())
         self.before = sync.baseline(view(row()), view(row()))
         (self.runtime / 'ledger.json').write_text(json.dumps(self.before), encoding='utf-8')
@@ -578,7 +578,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
 class ReadOnlyAndReportingReview(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='report-review-')
-        self.script_dir = Path(self.directory.name)
+        self.script_dir = Path(self.directory.name).resolve()
         self.runtime = self.script_dir / 'runtime'
         self.config_path = self.script_dir / 'config.json'
         self.config = {

@@ -112,7 +112,7 @@ class ProfileProtectionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='setup-profile-test-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.profile = self.root / 'profile' / 'config.json'
         self.original = config(self.root)
 
@@ -194,7 +194,7 @@ class WizardEntryPointTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='setup-entry-test-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.profile = self.root / 'config.json'
         self.native = {'user': 'synthetic-user', 'home': '/srv/codex-fixture/linux-home',
                        'codex_home': '/srv/codex-fixture/linux-home/.codex',

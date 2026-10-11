@@ -53,7 +53,7 @@ class BackendStatusTests(unittest.TestCase):
 
     def test_linux_only_reads_comm_and_tolerates_process_exit(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             for pid, name in (("900001", "codex"), ("900002", "python3")):
                 directory = root / pid
                 directory.mkdir()
@@ -80,7 +80,7 @@ class DiagnosticTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.home = fixture(self.root / "synthetic-home", extra_column=True)
         self.backend_patch = mock.patch.object(ep, "backend_status", return_value={
             "backend_running": False, "backend_detection_ok": True,

@@ -20,7 +20,7 @@ import tempfile
 import time
 
 VERSION = 1
-SOFTWARE_VERSION = '2.0.2'
+SOFTWARE_VERSION = '2.0.3'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -604,7 +604,7 @@ REASON_LABELS = {
     'rollout_outside_home': '正文路径不在当地数据目录内',
     'environment_paths_unavailable': '会话环境路径无法安全转换',
     'workspace_cwd_unmappable': '原工作目录无法映射或已不存在',
-    'environment_record_too_large': '环境记录超过可安全解析的大小',
+    'environment_record_too_large': '单条记录超过可安全解析的大小',
 }
 COUNT_LABELS = {'thread_count': '聊天', 'rollout_missing': '正文缺失',
     'rollout_outside_home': '正文路径越界', 'rollout_incomplete': '正文未写完',
