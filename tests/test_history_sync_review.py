@@ -344,7 +344,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.imported_record = row(body='imported-native')
         self.endpoint.call.side_effect = lambda side, operation, *args: (
             {'ok': True, 'record': copy.deepcopy(self.imported_record)}
-            if operation == 'import' else {'ok': True}
+            if operation == 'import' else ({'ok': True, 'compatible': True} if operation == 'import-preview' else {'ok': True})
         )
 
     def tearDown(self):
@@ -371,6 +371,8 @@ class CoordinatorCheckpointReview(unittest.TestCase):
             if operation == 'import':
                 imported = row(self.exported_id, body='imported-native')
                 return {'ok': True, 'revision': imported['revision'], 'record': imported}
+            if operation == 'import-preview':
+                return {'ok': True, 'compatible': True}
             return {'ok': True}
         self.endpoint.call.side_effect = transfer
 
@@ -392,7 +394,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
                 imported.pop(missing)
                 self.endpoint.call.side_effect = lambda side, operation, *args: (
                     {'ok': True, 'record': copy.deepcopy(imported)}
-                    if operation == 'import' else {'ok': True}
+                    if operation == 'import' else ({'ok': True, 'compatible': True} if operation == 'import-preview' else {'ok': True})
                 )
                 with self.assertRaises(RuntimeError):
                     self.execute()
@@ -404,7 +406,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.endpoint.call.side_effect = lambda side, operation, *args: (
             {'ok': True, 'record': copy.deepcopy(self.imported_record),
              'revision': 'another-revision'}
-            if operation == 'import' else {'ok': True}
+            if operation == 'import' else ({'ok': True, 'compatible': True} if operation == 'import-preview' else {'ok': True})
         )
         with self.assertRaises(RuntimeError):
             self.execute()
@@ -436,7 +438,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.assertEqual(summary['transferred'], 2)
         self.assertEqual(summary['remaining_transfers'], 1)
         self.assertEqual(summary['run_limits']['max_transfers_per_run'], 2)
-        self.assertEqual(self.operations(), ['export', 'import', 'export', 'import'])
+        self.assertEqual(self.operations(), ['export', 'import-preview', 'import', 'export', 'import-preview', 'import'])
         self.assertFalse((self.runtime / 'pending.json').exists())
         self.assertFalse(any(self.runtime.glob('transfer-*')))
 
@@ -458,7 +460,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.assertEqual(summary['remaining_transfers'], 1)
         self.assertEqual(summary['batch_stop_reason'], 'time_budget')
         self.assertEqual(summary['elapsed_seconds'], 121)
-        self.assertEqual(self.operations(), ['export', 'import'])
+        self.assertEqual(self.operations(), ['export', 'import-preview', 'import'])
         self.assertEqual(self.saved()['threads']['new-00']['wsl']['revision'],
                          'imported-native/meta-0')
         self.assertFalse((self.runtime / 'pending.json').exists())
@@ -491,7 +493,7 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.assertEqual(summary['deferred'], [
             {'id': 'chat-1', 'reason': 'target_backend_started'},
         ])
-        self.assertEqual(self.operations(), ['export'])
+        self.assertEqual(self.operations(), ['export', 'import-preview'])
         self.assertEqual(self.saved(), self.before)
         self.assertFalse((self.runtime / 'pending.json').exists())
 

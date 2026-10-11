@@ -9,6 +9,7 @@ only after verifying that the destination Codex backend is stopped.
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
 import hashlib
 import json
@@ -37,6 +38,7 @@ LOCAL_FIELDS = {
 METADATA_FIELDS = ("title", "name", "archived", "archived_at")
 INSPECT_FIELDS = ("id", "rollout_path", "source", "title", "name", "archived", "history_mode")
 CHUNK_SIZE = 512 * 1024
+MAX_ENVIRONMENT_RECORD_BYTES = 8 * 1024 * 1024
 CACHE_HASH_FIELDS = {
     "thread_turns": ("turn_id", "rollout_ordinal", "status", "error_json", "started_at", "completed_at", "duration_ms", "first_user_item_id", "final_agent_item_id", "rollout_byte_offset", "rollout_end_ordinal", "rollout_end_byte_offset"),
     "thread_items": ("turn_id", "item_id", "rollout_ordinal", "created_at_ms", "item_type", "updated_at_ordinal", "started_at_ms", "completed_at_ms"),
@@ -735,7 +737,7 @@ def export_chat(args):
         path = safe_rollout(home, row)
         payload = {key: row[key] for key in PORTABLE_FIELDS if key in row}
         meta = {"format_version": FORMAT_VERSION, "thread": payload, "source_revision": revision,
-                "source_platform": "windows" if os.name == "nt" else "linux",
+                "source_platform": native_platform(),
                 "relative_rollout_path": path.relative_to(home).as_posix(),
                 "metadata_only": bool(args.metadata_only)}
         if not args.metadata_only:
@@ -764,25 +766,315 @@ def export_chat(args):
             history.close()
 
 
+def native_platform():
+    return "windows" if os.name == "nt" else "linux"
+
+
+def translated_absolute_path(value, platform):
+    """Map an explicit local path, without guessing a replacement directory."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    # Extended drive paths have the same meaning as their ordinary spelling.
+    # UNC, device paths, drive-relative paths and parent traversal are excluded.
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    drive = re.fullmatch(r"([A-Za-z]):[\\/](.*)", value)
+    if drive:
+        parts = re.split(r"[\\/]", drive.group(2))
+        if any(part in (".", "..") or part.endswith((".", " ")) or re.search(r'[<>:"|?*\x00-\x1f]', part)
+               or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
+               for part in parts if part):
+            return None
+        if platform == "linux":
+            return "/mnt/" + drive.group(1).lower() + "/" + drive.group(2).replace("\\", "/")
+        if platform == "windows":
+            return drive.group(1).upper() + ":\\" + drive.group(2).replace("/", "\\")
+        return None
+    if not value.startswith("/") or value.startswith("//") or any(part in (".", "..") for part in value.split("/")):
+        return None
+    if platform == "linux":
+        return value
+    if platform == "windows":
+        mount = re.fullmatch(r"/mnt/([A-Za-z])(?:/(.*))?", value)
+        if mount:
+            tail = mount.group(2) or ""
+            # A backslash is a filename character on Linux and a separator on
+            # Windows. Mapping it could select a different, broader directory.
+            if "\\" in tail or ":" in tail:
+                return None
+            if any(part.endswith((".", " ")) or re.search(r'[<>"|?*\x00-\x1f]', part)
+                   or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
+                   for part in tail.split("/") if part):
+                return None
+            return mount.group(1).upper() + ":\\" + tail.replace("/", "\\")
+    return None
+
+
+def translate_workspace_root(value, platform=None):
+    """Pure path mapping; unmappable roots never become home or a drive root."""
+    platform = platform or native_platform()
+    mapped = translated_absolute_path(value, platform)
+    if mapped is None:
+        return None
+    if platform == "linux":
+        if not mapped.strip("/") or re.fullmatch(r"/mnt/[A-Za-z]/*", mapped):
+            return None
+    elif re.fullmatch(r"[A-Za-z]:[\\/]*", mapped):
+        return None
+    return mapped
+
+
+def workspace_root_exists(value):
+    """The endpoint checks paths on its own host, never another host's database."""
+    try:
+        return Path(value).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
 def translate_cwd(value, platform=None):
-    platform = platform or ("windows" if os.name == "nt" else "linux")
     if not isinstance(value, str):
         fail("invalid_cwd", "Source cwd must be a string")
-    if platform == "linux":
-        match = re.match(r"^([A-Za-z]):[\\/](.*)$", value)
-        if match:
-            return "/mnt/" + match.group(1).lower() + "/" + match.group(2).replace("\\", "/")
-        if value.startswith("/"):
-            return value
-    else:
-        match = re.match(r"^/mnt/([A-Za-z])(?:/(.*))?$", value)
-        if match:
-            return match.group(1).upper() + ":\\" + (match.group(2) or "").replace("/", "\\")
-        if re.match(r"^[A-Za-z]:[\\/]", value):
-            return value
+    mapped = translated_absolute_path(value, platform or native_platform())
     # Linux /home paths cannot be translated to a Windows drive safely. Keep a
     # native neutral cwd; original cwd remains in the backed-up/exported metadata.
-    return str(Path.home())
+    return mapped if mapped is not None else str(Path.home())
+
+
+def local_environment_cwd(value, platform=None):
+    if not isinstance(value, str):
+        fail("invalid_cwd", "Source cwd must be a string")
+    mapped = translated_absolute_path(value, platform or native_platform())
+    if mapped is None or not workspace_root_exists(mapped):
+        # A workspace-write policy can implicitly authorize its cwd. Falling
+        # back to home would therefore grant access beyond the original project.
+        fail("workspace_cwd_unmappable", "Workspace cwd must map to an existing native directory")
+    return mapped
+
+
+def environment_path_summary():
+    return {"environment_lines_changed": 0, "workspace_paths_translated": 0,
+            "workspace_roots_removed": 0, "cwd_fallbacks": 0}
+
+
+def rewrite_environment_line(line, platform):
+    """Only historical environment records carry paths we are allowed to edit.
+
+    Message text, tool inputs and unknown nested fields are not path metadata.
+    Unchanged records retain their original bytes, including JSON formatting.
+    """
+    summary = environment_path_summary()
+    try:
+        record = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("invalid_transcript", "Transcript contains an invalid JSONL record")
+    if not isinstance(record, dict) or record.get("type") not in ("session_meta", "turn_context"):
+        return line, summary
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        fail("invalid_environment", "Transcript environment payload must be an object")
+    changed = False
+    if "cwd" in payload:
+        original = payload["cwd"]
+        if not isinstance(original, str):
+            fail("invalid_cwd", "Transcript environment cwd must be a string")
+        mapped = translated_absolute_path(original, platform)
+        if mapped is None or not workspace_root_exists(mapped):
+            fail("workspace_cwd_unmappable", "Transcript cwd must map to an existing native directory")
+        if mapped != original:
+            payload["cwd"] = mapped
+            summary["workspace_paths_translated"] += 1
+            changed = True
+    for key in ("runtime_workspace_roots", "workspace_roots"):
+        if key not in payload or payload[key] is None:
+            continue
+        original = payload[key]
+        if not isinstance(original, list):
+            fail("invalid_workspace_roots", "Transcript workspace roots must be a list")
+        mapped_roots = []
+        for root in original:
+            mapped = translate_workspace_root(root, platform)
+            if mapped is None or not workspace_root_exists(mapped):
+                summary["workspace_roots_removed"] += 1
+                continue
+            if mapped != root:
+                summary["workspace_paths_translated"] += 1
+            if mapped not in mapped_roots:
+                mapped_roots.append(mapped)
+        if mapped_roots != original:
+            payload[key] = mapped_roots
+            changed = True
+    if changed:
+        summary["environment_lines_changed"] = 1
+        return canonical(record) + b"\n", summary
+    return line, summary
+
+
+def transcript_environment_chunks(stream, platform):
+    """Bound buffers for large message/image records, retaining their bytes.
+
+    Native Codex writes the type before the payload. A long ordinary record
+    with that unambiguous header can pass through in chunks; environment or
+    unfamiliar layouts are limited before attempting a full JSON decode.
+    """
+    ordinary_header = re.compile(
+        rb'^\s*\{\s*(?:"timestamp"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*)?'
+        rb'"type"\s*:\s*"([^"\\]+)"\s*[,}]'
+    )
+    while True:
+        initial = stream.readline(CHUNK_SIZE)
+        if not initial:
+            return
+        if initial.endswith(b"\n"):
+            rewritten, counts = rewrite_environment_line(initial, platform)
+            yield initial, rewritten, counts
+            continue
+        kind = ordinary_header.match(initial)
+        if kind is not None and kind.group(1) not in (b"session_meta", b"turn_context"):
+            yield initial, initial, environment_path_summary()
+            while True:
+                chunk = stream.readline(CHUNK_SIZE)
+                if not chunk:
+                    fail("incomplete_transcript", "Environment repair requires complete JSONL records")
+                yield chunk, chunk, environment_path_summary()
+                if chunk.endswith(b"\n"):
+                    break
+            continue
+        record = bytearray(initial)
+        while not record.endswith(b"\n"):
+            remaining = MAX_ENVIRONMENT_RECORD_BYTES - len(record)
+            if remaining <= 0:
+                fail("environment_record_too_large", "Environment record exceeds the safe JSON decode limit")
+            chunk = stream.readline(min(CHUNK_SIZE, remaining))
+            if not chunk:
+                fail("incomplete_transcript", "Environment repair requires complete JSONL records")
+            record.extend(chunk)
+        original = bytes(record)
+        rewritten, counts = rewrite_environment_line(original, platform)
+        yield original, rewritten, counts
+
+
+def inspect_workspace_environment(path, platform=None):
+    """Read-only repair preview, exposing counts rather than private paths."""
+    path = Path(path)
+    platform = platform or native_platform()
+    summary = environment_path_summary()
+    before = path.stat()
+    with path.open("rb") as stream:
+        for _, _, counts in transcript_environment_chunks(stream, platform):
+            for key in summary:
+                summary[key] += counts[key]
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        fail("source_changed", "Transcript changed during the environment preview")
+    return summary
+
+
+def path_preview(args):
+    home = native_home(args.home)
+    sources = scoped_sources(args.scope)
+    state = readonly(home / "state_5.sqlite")
+    try:
+        state.execute("BEGIN")
+        row = thread_row(state, args.id)
+        if row is None:
+            fail("thread_missing", "Requested chat is absent")
+        if row.get("source") not in sources:
+            fail("out_of_scope", "Requested chat is outside the configured scope")
+        path = safe_rollout(home, row)
+        if not path.is_file():
+            fail("rollout_missing", "Chat rollout is missing")
+        summary = inspect_workspace_environment(path)
+        cwd_changed = local_environment_cwd(row.get("cwd", "")) != row.get("cwd", "")
+        return {"ok": True, "id": row["id"], **summary, "environment_paths": summary,
+                "database_cwd_changed": cwd_changed,
+                "needs_repair": bool(summary["environment_lines_changed"] or cwd_changed)}
+    finally:
+        state.close()
+
+
+def rewrite_transcript_environment(source, destination, platform=None):
+    """Stage mapped environment records and the exact old/new byte boundaries.
+
+    The transport package remains untouched and retains its original checksum.
+    The destination is rehashed normally after import; offsets are translated
+    before installing the package's native history cache.
+    """
+    source, destination = Path(source), Path(destination)
+    platform = platform or native_platform()
+    before = source.stat()
+    summary = environment_path_summary()
+    hasher = hashlib.sha256()
+    old_offset = new_offset = 0
+    changes = []
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        for line, rewritten, counts in transcript_environment_chunks(reader, platform):
+            for key in summary:
+                summary[key] += counts[key]
+            if rewritten != line:
+                changes.append((old_offset, old_offset + len(line), new_offset, new_offset + len(rewritten)))
+            writer.write(rewritten)
+            hasher.update(rewritten)
+            old_offset += len(line)
+            new_offset += len(rewritten)
+        writer.flush()
+        os.fsync(writer.fileno())
+    after = source.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or old_offset != before.st_size:
+        fail("source_changed", "Transcript changed while environment paths were being mapped")
+    os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
+    return {**summary, "sha256": hasher.hexdigest(), "size": new_offset,
+            "source_size": old_offset, "mtime_ns": before.st_mtime_ns,
+            "offset_map": changes, "offset_ends": [item[1] for item in changes]}
+
+
+def translated_rollout_offset(value, rewrite, source):
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= rewrite["source_size"]:
+        fail("invalid_rollout_offset", "Cache offset is outside the original transcript")
+    # Even unchanged lines must use a record boundary. Guessing an ordinal's
+    # start is unsafe: a turn's end offset can point to the following record.
+    if value:
+        source.seek(value - 1)
+        if source.read(1) != b"\n":
+            fail("invalid_rollout_offset", "Cache offset is not a JSONL record boundary")
+    position = bisect.bisect_right(rewrite["offset_ends"], value)
+    if position < len(rewrite["offset_map"]):
+        next_change = rewrite["offset_map"][position]
+        if next_change[0] < value < next_change[1]:
+            fail("invalid_rollout_offset", "Cache offset falls inside a rewritten environment record")
+    if not position:
+        return value
+    prior = rewrite["offset_map"][position - 1]
+    return value + prior[3] - prior[1]
+
+
+def update_native_rollout_offsets(target, thread_id, rewrite, source):
+    """Local environment repair must preserve every native cache field."""
+    for table, offset_names in (
+        ("thread_turns", ("rollout_byte_offset", "rollout_end_byte_offset")),
+        ("thread_history_projection_state", ("next_rollout_byte_offset",)),
+    ):
+        info = table_info(target, table, "history")
+        if not info:
+            continue
+        names = {entry[1] for entry in info}
+        offsets = [name for name in offset_names if name in names]
+        if not offsets:
+            continue
+        keys = [entry[1] for entry in sorted(info, key=lambda value: value[5]) if entry[5]]
+        if "thread_id" not in keys:
+            fail("schema_incompatible", "Native cache has no supported per-chat primary key")
+        fields = keys + offsets
+        query = f"SELECT {','.join(quote(name) for name in fields)} FROM history.{quote(table)} WHERE thread_id=?"
+        for row in target.execute(query, (thread_id,)):
+            translated = [translated_rollout_offset(row[name], rewrite, source) for name in offsets]
+            target.execute(
+                f"UPDATE history.{quote(table)} SET " + ",".join(quote(name) + "=?" for name in offsets)
+                + " WHERE " + " AND ".join(quote(name) + "=?" for name in keys),
+                tuple(translated) + tuple(row[name] for name in keys),
+            )
 
 
 def target_rollout(home, meta, existing):
@@ -881,6 +1173,34 @@ def check_package(meta, package, metadata_only):
         cache.close()
 
 
+def import_preview(args):
+    """Check predictable environment compatibility before a controller journal.
+
+    Package corruption is still an error. Unsupported native environment paths
+    are a normal deferral so a controller can continue with other quiet chats.
+    """
+    native_home(args.home)
+    sources = scoped_sources(args.scope)
+    package = Path(args.package).expanduser().resolve()
+    meta = json.loads((package / "meta.json").read_text(encoding="utf-8"))
+    check_package(meta, package, False)
+    imported = meta["thread"]
+    if imported.get("source") not in sources:
+        fail("out_of_scope", "Package chat is outside the configured scope")
+    compatible_errors = {"workspace_cwd_unmappable", "invalid_cwd", "invalid_transcript",
+                         "invalid_environment", "invalid_workspace_roots", "environment_record_too_large",
+                         "transcript_record_too_large", "incomplete_transcript"}
+    try:
+        mapped_cwd = local_environment_cwd(imported.get("cwd", ""))
+        summary = inspect_workspace_environment(package / "transcript.jsonl")
+    except EndpointError as error:
+        if error.code not in compatible_errors:
+            raise
+        return {"ok": True, "id": imported["id"], "compatible": False, "reason": error.code}
+    return {"ok": True, "id": imported["id"], "compatible": True,
+            "environment_paths": summary, "database_cwd_changed": mapped_cwd != imported.get("cwd", "")}
+
+
 def backup_chat(home, target, row, thread_id):
     folder = home / ".history-sync-backups" / thread_id / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
     folder.mkdir(parents=True, exist_ok=False)
@@ -907,6 +1227,9 @@ def import_chat(args):
     check_package(meta, package, args.metadata_only)
     imported = meta["thread"]
     thread_id = imported["id"]
+    environment_only = bool(getattr(args, "environment_only", False))
+    if environment_only and args.metadata_only:
+        fail("environment_repair_invalid", "Environment-only repair cannot be combined with metadata-only import")
     if imported.get("source") not in sources:
         fail("out_of_scope", "Package chat is outside the configured scope")
     if not args.expected:
@@ -932,10 +1255,14 @@ def import_chat(args):
     destination = None
     existing = None
     committed = False
+    environment_paths = environment_path_summary()
+    database_cwd_changed = False
     try:
         target.execute("BEGIN IMMEDIATE")
         existing = thread_row(target, thread_id)
         if existing is None:
+            if environment_only:
+                fail("environment_target_missing", "Environment-only repair requires an existing native chat")
             if args.expected != "absent":
                 fail("target_changed", "Target chat is now absent but an existing revision was expected")
             if args.metadata_only:
@@ -950,7 +1277,14 @@ def import_chat(args):
                 fail("target_changed", "Target revision changed since inspection")
             if current["active"]:
                 fail("target_active", "Target chat is active or has not been quiet long enough")
-        destination = target_rollout(home, meta, existing)
+            if environment_only:
+                source_revision = meta.get("source_revision")
+                declared = meta.get("transcript", {})
+                if not isinstance(source_revision, dict) or source_revision.get("revision") != args.expected \
+                        or meta.get("source_platform") != native_platform() \
+                        or digest({"sha256": declared.get("sha256"), "size": declared.get("size")}) != current["transcript_revision"]:
+                    fail("environment_source_mismatch", "Environment repair package must match this exact native chat revision and transcript")
+        destination = safe_rollout(home, existing) if environment_only else target_rollout(home, meta, existing)
         old_path = safe_rollout(home, existing) if existing is not None else None
         if destination.exists() and (old_path is None or destination != old_path):
             fail("rollout_collision", "Destination rollout already exists without the expected target record")
@@ -959,7 +1293,8 @@ def import_chat(args):
             validate_cache_schema(target, cache)
         backup = backup_chat(home, target, existing, thread_id)
         write_json(backup / "journal.json", {"status": "pending", "id": thread_id, "expected": args.expected,
-                   "destination": str(destination), "metadata_only": bool(args.metadata_only)})
+                   "destination": str(destination), "metadata_only": bool(args.metadata_only),
+                   "environment_only": environment_only})
         destination.parent.mkdir(parents=True, exist_ok=True)
         if args.metadata_only:
             if old_path is not None and old_path != destination:
@@ -970,7 +1305,8 @@ def import_chat(args):
                 installed = True
         else:
             staged = destination.with_name(destination.name + ".sync-" + uuid.uuid4().hex + ".tmp")
-            copy_file_checked(package / "transcript.jsonl", staged)
+            rewrite = rewrite_transcript_environment(package / "transcript.jsonl", staged)
+            environment_paths = {key: rewrite[key] for key in environment_paths}
             if existing is not None:
                 # Recheck full bytes under the SQLite write lock before
                 # replacement. Caller must also keep the native backend stopped.
@@ -983,24 +1319,41 @@ def import_chat(args):
             if old_path is not None and old_path != destination:
                 old_path.unlink()
                 moved_from = old_path
-            for table in CACHE_TABLES:
-                if not table_exists(target, table, "history"):
-                    continue
-                target.execute(f"DELETE FROM history.{quote(table)} WHERE thread_id=?", (thread_id,))
-                if not table_exists(cache, table):
-                    continue
-                names = columns(cache, table)
-                fields = ",".join(quote(name) for name in names)
-                sql = f"INSERT INTO history.{quote(table)} ({fields}) VALUES ({','.join('?' for _ in names)})"
-                for record in cache.execute(f"SELECT {fields} FROM {quote(table)} WHERE thread_id=?", (thread_id,)):
-                    target.execute(sql, tuple(record))
+            with (package / "transcript.jsonl").open("rb") as offset_source:
+                if environment_only:
+                    update_native_rollout_offsets(target, thread_id, rewrite, offset_source)
+                for table in CACHE_TABLES:
+                    if environment_only:
+                        break
+                    if not table_exists(target, table, "history"):
+                        continue
+                    target.execute(f"DELETE FROM history.{quote(table)} WHERE thread_id=?", (thread_id,))
+                    if not table_exists(cache, table):
+                        continue
+                    names = columns(cache, table)
+                    fields = ",".join(quote(name) for name in names)
+                    sql = f"INSERT INTO history.{quote(table)} ({fields}) VALUES ({','.join('?' for _ in names)})"
+                    for record in cache.execute(f"SELECT {fields} FROM {quote(table)} WHERE thread_id=?", (thread_id,)):
+                        values = list(record)
+                        offset_names = (("rollout_byte_offset", "rollout_end_byte_offset") if table == "thread_turns"
+                                        else ("next_rollout_byte_offset",) if table == "thread_history_projection_state" else ())
+                        for name in offset_names:
+                            if name in names:
+                                index = names.index(name)
+                                values[index] = translated_rollout_offset(values[index], rewrite, offset_source)
+                        target.execute(sql, tuple(values))
         target_columns = set(columns(target, "threads"))
         if args.metadata_only:
             updates = {key: imported.get(key) for key in METADATA_FIELDS if key in target_columns}
+        elif environment_only:
+            updates = {"cwd": local_environment_cwd(existing.get("cwd", ""))}
+            database_cwd_changed = updates["cwd"] != existing.get("cwd", "")
         else:
             updates = {key: value for key, value in imported.items() if key in PORTABLE_FIELDS and key in target_columns and key not in LOCAL_FIELDS}
-            updates["cwd"] = translate_cwd(imported.get("cwd", ""))
-        updates["rollout_path"] = str(destination)
+            updates["cwd"] = local_environment_cwd(imported.get("cwd", ""))
+            database_cwd_changed = updates["cwd"] != imported.get("cwd", "")
+        if not environment_only:
+            updates["rollout_path"] = str(destination)
         if existing is not None:
             updates.pop("id", None)
             target.execute("UPDATE threads SET " + ",".join(quote(key) + "=?" for key in updates) + " WHERE id=?",
@@ -1024,15 +1377,16 @@ def import_chat(args):
         current = revision_from_connections(home, committed_row, target, args.quiet_seconds, "history")
         write_json(backup / "journal.json", {"status": "pending", "id": thread_id, "expected": args.expected,
                    "result_revision": current["revision"], "destination": str(destination),
-                   "metadata_only": bool(args.metadata_only)})
+                   "metadata_only": bool(args.metadata_only), "environment_only": environment_only})
         target.commit()
         committed = True
         write_json(backup / "journal.json", {"status": "committed", "id": thread_id, "expected": args.expected,
                    "result_revision": current["revision"], "destination": str(destination),
-                   "metadata_only": bool(args.metadata_only)})
+                   "metadata_only": bool(args.metadata_only), "environment_only": environment_only})
         return {"ok": True, "id": thread_id, "thread_id": thread_id, "revision": current["revision"],
                 "record": current, "thread": current,
-                "metadata_only": bool(args.metadata_only), "backup": str(backup)}
+                "environment_paths": environment_paths, "database_cwd_changed": database_cwd_changed,
+                "metadata_only": bool(args.metadata_only), "environment_only": environment_only, "backup": str(backup)}
     except BaseException:
         # If commit completed but receipt writing failed, leave the durable
         # pending journal for manual recovery. Restoring just the file after a
@@ -1066,7 +1420,7 @@ def import_chat(args):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "export", "import", "backend-status", "doctor"):
+    for name in ("inspect", "export", "import", "backend-status", "doctor", "path-preview", "import-preview"):
         command = subparsers.add_parser(name)
         command.add_argument("--home", required=True)
         command.add_argument("--scope", default="cli,vscode")
@@ -1075,10 +1429,13 @@ def build_parser():
             command.add_argument("--package", required=True)
             command.add_argument("--expected")
             command.add_argument("--metadata-only", action="store_true")
-        if name == "export":
+        if name == "import-preview":
+            command.add_argument("--package", required=True)
+        if name in ("export", "path-preview"):
             command.add_argument("--id", required=True)
         if name == "import":
             command.add_argument("--allow-existing", action="store_true")
+            command.add_argument("--environment-only", action="store_true")
         if name == "doctor":
             command.add_argument("--quick-check", action="store_true")
     return parser
@@ -1094,7 +1451,8 @@ def main():
         if args.quiet_seconds < 0:
             fail("quiet_invalid", "Quiet seconds must be nonnegative")
         operation = {"inspect": inspect_home, "export": export_chat, "import": import_chat,
-                     "backend-status": backend_status_command, "doctor": doctor_home}[args.command]
+                     "backend-status": backend_status_command, "doctor": doctor_home,
+                     "path-preview": path_preview, "import-preview": import_preview}[args.command]
         result = operation(args)
     except EndpointError as error:
         print(json.dumps({"ok": False, "code": error.code, "message": str(error)}, ensure_ascii=True))

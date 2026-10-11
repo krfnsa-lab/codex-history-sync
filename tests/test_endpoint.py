@@ -39,7 +39,7 @@ def fixture(root, with_chat=True, extra_column=False, item_text="source text"):
         quiet = time.time() - 7200
         os.utime(transcript, (quiet, quiet))
         c.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (ID, str(transcript), 100, 200, "vscode", "openai", r"C:\repo", "Original", "local-policy", "local-approval", "Original name", 0, None, "paginated", "local-project", "local-section", 1))
+                  (ID, str(transcript), 100, 200, "vscode", "openai", str(root), "Original", "local-policy", "local-approval", "Original name", 0, None, "paginated", "local-project", "local-section", 1))
     c.commit(); c.close()
     c = sqlite3.connect(root / "thread_history_1.sqlite")
     c.execute("CREATE TABLE _sqlx_migrations(version INTEGER PRIMARY KEY,checksum BLOB)")

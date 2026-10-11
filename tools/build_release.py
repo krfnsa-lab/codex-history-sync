@@ -20,7 +20,7 @@ import zipfile
 ARCHIVE_ROOT = "codex-history-sync"
 REQUIRED_FILES = frozenset((
     "history_endpoint.py", "history_sync.py", "setup.py", "config.example.json",
-    "install.ps1", "uninstall.ps1", "sync-now.ps1", "status.ps1", "doctor.ps1",
+    "install.ps1", "uninstall.ps1", "sync-now.ps1", "status.ps1", "doctor.ps1", "repair-paths.ps1",
     "configure.ps1", "Common.ps1", "README.md", "CHANGELOG.md", "LICENSE", ".gitignore",
     "docs/SAFETY.md", "docs/CONFIGURATION.md", ".github/workflows/ci.yml",
     "tools/build_release.py", "tests/test_endpoint.py", "tests/test_diagnostics.py",

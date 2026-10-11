@@ -20,7 +20,7 @@ import tempfile
 import time
 
 VERSION = 1
-SOFTWARE_VERSION = '2.0.1'
+SOFTWARE_VERSION = '2.0.2'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -283,6 +283,12 @@ def execute(config, args, runtime, log, progress=None):
             target_package = package if action['target'] == 'windows' else linux_mount_path(package)
             options = ['--metadata-only'] if action['mode'] == 'metadata' else []
             endpoint.call(action['source'], 'export', '--id', action['id'], '--package', source_package, '--expected', action['source_revision'], *options)
+            if action['mode'] == 'full':
+                preview = endpoint.call(action['target'], 'import-preview', '--package', target_package)
+                if preview.get('compatible') is False:
+                    summary['deferred'].append({'id': action['id'], 'reason': preview.get('reason', 'environment_paths_unavailable')})
+                    log.info('Deferred %s: environment paths are unavailable on target', action['id'])
+                    continue
             # Recheck before any existing record replacement.
             if action['target_revision'] != 'absent' and endpoint.backend_status(action['target']).get('backend_running', True):
                 log.info('Deferred existing chat %s: target backend started', action['id'])
@@ -314,6 +320,107 @@ def execute(config, args, runtime, log, progress=None):
     atomic_json(runtime / 'attention.json', {'updated_at': utc_now(), 'blocked': plan['blocked'],
         'deferred': summary['deferred'], 'endpoint_skipped': summary['endpoint_skipped']})
     return finish(summary)
+
+
+def repair_environment_paths(config, args, runtime, log, progress=None):
+    """Repair native environment metadata without copying the other replica.
+
+    Use the normal export/import receipts, backup and stopped-backend checks.
+    A pre-existing local edit must remain pending against its old baseline.
+    """
+    started = time.monotonic()
+    side = args.repair_side
+    if side == 'wsl' and not wsl_running(config['wsl_distro']):
+        return {'status': 'skipped_wsl_stopped', 'repaired': 0}
+    ledger_path = runtime / 'ledger.json'
+    if not ledger_path.is_file():
+        raise RuntimeError('路径修复需要现有同步基线；请先初始化配置')
+    ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
+    if isinstance(ledger.get('version'), bool) or ledger.get('version') != VERSION or not isinstance(ledger.get('threads'), dict):
+        raise RuntimeError('Unsupported synchronization ledger version')
+    journal = runtime / 'pending.json'
+    if journal.exists():
+        raise RuntimeError('An unfinished prior import exists; review runtime/pending.json before continuing')
+    endpoint = Endpoints(config, SCRIPT_DIR)
+    view = endpoint.inspect(side)
+    native_records = records(view)
+    selected = sorted(set(args.thread_ids or [tid for tid, pair in ledger['threads'].items()
+                                             if pair.get(side) is not None]))
+    summary = progress if progress is not None else {}
+    summary.update({'status': 'path_repair_preview' if args.dry_run else 'path_repair_completed',
+                    'repair_side': side, 'planned_repairs': 0, 'repaired': 0,
+                    'unchanged': 0, 'blocked': [], 'repairs': []})
+    maximum = config.get('max_transfers_per_run', DEFAULT_MAX_TRANSFERS)
+    budget = config.get('run_budget_seconds', DEFAULT_RUN_BUDGET)
+    ledger_backup = None
+    for tid in selected:
+        if time.monotonic() - started >= budget:
+            summary['batch_stop_reason'] = 'time_budget'
+            break
+        pair = ledger['threads'].get(tid)
+        row = native_records.get(tid)
+        if not pair or not isinstance(pair.get(side), dict) or row is None:
+            summary['blocked'].append({'id': tid, 'reason': 'endpoint_record_unavailable'})
+            continue
+        try:
+            preview = endpoint.call(side, 'path-preview', '--id', tid)
+        except RuntimeError:
+            summary['blocked'].append({'id': tid, 'reason': 'environment_paths_unavailable'})
+            continue
+        if not preview.get('needs_repair'):
+            summary['unchanged'] += 1
+            continue
+        summary['planned_repairs'] += 1
+        entry = {'id': tid, 'environment_paths': preview.get('environment_paths', {}),
+                 'database_cwd_changed': bool(preview.get('database_cwd_changed'))}
+        summary['repairs'].append(entry)
+        if args.dry_run:
+            continue
+        if is_busy(row, config.get('quiet_seconds', 60)):
+            summary['blocked'].append({'id': tid, 'reason': 'target_busy'})
+            continue
+        if endpoint.backend_status(side).get('backend_running', True):
+            summary['blocked'].append({'id': tid, 'reason': 'target_backend_running'})
+            continue
+        if summary['repaired'] >= maximum:
+            summary['batch_stop_reason'] = 'batch_limit'
+            break
+        if ledger_backup is None:
+            backup_root = runtime / 'path-repair-backups' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+            backup_root.mkdir(parents=True, exist_ok=False)
+            ledger_backup = backup_root / 'ledger.json'
+            shutil.copy2(ledger_path, ledger_backup)
+            summary['ledger_backup'] = str(ledger_backup)
+        with tempfile.TemporaryDirectory(prefix='path-repair-', dir=runtime) as temporary:
+            package = temporary if side == 'windows' else linux_mount_path(temporary)
+            endpoint.call(side, 'export', '--id', tid, '--package', package, '--expected', row['revision'])
+            if endpoint.backend_status(side).get('backend_running', True):
+                summary['blocked'].append({'id': tid, 'reason': 'target_backend_started'})
+                continue
+            atomic_json(journal, {'operation': 'repair_environment_paths', 'id': tid,
+                                 'side': side, 'target_revision': row['revision'],
+                                 'ledger_backup': str(ledger_backup)})
+            imported = endpoint.call(side, 'import', '--package', package,
+                                     '--expected', row['revision'], '--allow-existing', '--environment-only')
+            repaired = imported.get('record')
+            if not isinstance(repaired, dict) or repaired.get('id') != tid or any(
+                    not isinstance(repaired.get(key), str) or not repaired[key]
+                    for key in ('revision', 'content_revision', 'metadata_revision')):
+                raise RuntimeError('Importer did not return its committed chat revision')
+            if imported.get('revision') != repaired['revision']:
+                raise RuntimeError('Importer receipt revision does not match its committed record')
+            baseline_updated = pair[side].get('revision') == row['revision']
+            if baseline_updated:
+                pair[side] = repaired
+                atomic_json(ledger_path, ledger)
+            entry.update({'backup': imported.get('backup'), 'repaired': True,
+                          'baseline_updated': baseline_updated,
+                          'environment_paths': imported.get('environment_paths', entry['environment_paths'])})
+            summary['repaired'] += 1
+            journal.unlink()
+            log.info('Repaired native environment paths for %s on %s', tid, side)
+    summary['elapsed_seconds'] = round(time.monotonic() - started, 3)
+    return summary
 
 
 def utc_now():
@@ -495,6 +602,9 @@ REASON_LABELS = {
     'endpoint_record_unavailable': '无法安全读取某端记录', 'unreadable_transcript': '正文缺失或不完整',
     'empty_conversation': '聊天为空', 'unindexed_history': '旧正文尚未建立索引',
     'rollout_outside_home': '正文路径不在当地数据目录内',
+    'environment_paths_unavailable': '会话环境路径无法安全转换',
+    'workspace_cwd_unmappable': '原工作目录无法映射或已不存在',
+    'environment_record_too_large': '环境记录超过可安全解析的大小',
 }
 COUNT_LABELS = {'thread_count': '聊天', 'rollout_missing': '正文缺失',
     'rollout_outside_home': '正文路径越界', 'rollout_incomplete': '正文未写完',
@@ -531,6 +641,15 @@ def local_timestamp(value):
 
 def human_summary(value, include_issues=True):
     status = value.get('status')
+    if status in ('path_repair_preview', 'path_repair_completed'):
+        lines = ['路径修复预览（未修改聊天或基线）' if status == 'path_repair_preview' else '聊天环境路径修复完成',
+                 f"待修复：{value['planned_repairs']} 条；已修复：{value['repaired']} 条；无需修复：{value['unchanged']} 条"]
+        lines.extend(issue_lines(value))
+        if value.get('ledger_backup'):
+            lines.append('原基线和每条聊天已分别备份')
+        if value.get('elapsed_seconds') is not None:
+            lines.append(f"用时：{value['elapsed_seconds']} 秒")
+        return '\n'.join(lines)
     if status == 'cached_status':
         lines = ['同步状态（来自本地缓存，不检查进程或启动 WSL）',
                  f"基线：{'已初始化' if value['initialized'] else '未初始化或无效'}；跟踪聊天：{value['tracked_chats']} 条",
@@ -609,12 +728,19 @@ def main(argv=None):
     parser.add_argument('--python-windows', help='本轮端点解释器，覆盖配置')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--json', action='store_true', help='机器可读的 JSON 输出')
+    parser.add_argument('--repair-paths', action='store_true', help='修复已同步聊天的本地环境路径')
+    parser.add_argument('--repair-side', choices=('windows', 'wsl'), default='wsl')
+    parser.add_argument('--id', dest='thread_ids', action='append', help='仅修复指定聊天，可重复使用')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--dry-run', action='store_true')
     mode.add_argument('--initialize', action='store_true')
     mode.add_argument('--status', action='store_true')
     mode.add_argument('--doctor', action='store_true')
     args = parser.parse_args(argv)
+    if args.repair_paths and (args.initialize or args.status or args.doctor):
+        parser.error('--repair-paths can only be combined with --dry-run or --once')
+    if args.thread_ids and not args.repair_paths:
+        parser.error('--id requires --repair-paths')
     config_path = args.config.expanduser().resolve()
     raw_config, config_error = {}, None
     try:
@@ -675,7 +801,8 @@ def main(argv=None):
         require_local_drive(SCRIPT_DIR, '程序目录')
         with run_lock(runtime / 'run.lock') as acquired:
             if acquired:
-                summary = execute(config, args, runtime, log, progress)
+                summary = (repair_environment_paths(config, args, runtime, log, progress)
+                           if args.repair_paths else execute(config, args, runtime, log, progress))
                 if not args.dry_run:
                     save_run_report(runtime, summary)
             else:
