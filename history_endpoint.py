@@ -71,13 +71,33 @@ def quote(name):
     return '"' + name + '"'
 
 
-def native_home(value):
+def local_windows_path(value, error_code):
+    """Canonicalize only the extended spelling of an unambiguous local disk path.
+
+    Extended UNC and device namespaces stay forbidden. Components whose meaning
+    changes when the extended prefix is removed are rejected, rather than opening
+    a different file under the ordinary Win32 spelling.
+    """
     raw = str(value)
-    if os.name == "nt" and raw.startswith("\\\\"):
-        fail("non_native_home", "Windows endpoint must use a native Windows home, not a WSL UNC path")
+    if raw.startswith(("\\\\", "//")):
+        if not re.match(r"^\\\\\?\\[A-Za-z]:\\", raw):
+            fail(error_code, "Path must use a native local Windows disk")
+        raw = raw[4:]
+        if "/" in raw or any(
+            part in (".", "..") or part.endswith((".", " "))
+            or re.search(r'[<>:"|?*\x00-\x1f]', part)
+            or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.IGNORECASE)
+            for part in raw[3:].split("\\") if part
+        ):
+            fail(error_code, "Extended Windows path has ambiguous components")
+    return raw
+
+
+def native_home(value):
+    raw = local_windows_path(value, "non_native_home") if os.name == "nt" else str(value)
     path = Path(raw).expanduser().resolve()
-    if os.name == "nt" and str(path).startswith("\\\\"):
-        fail("non_native_home", "Windows endpoint must use a native Windows home, not a resolved network path")
+    if os.name == "nt":
+        path = Path(local_windows_path(path, "non_native_home"))
     if os.name != "nt" and re.match(r"^/mnt/[A-Za-z](?:/|$)", str(path)):
         fail("non_native_home", "WSL endpoint must use its native Linux home, not a Windows mount")
     if not path.is_dir():
@@ -215,7 +235,13 @@ def safe_rollout(home, row):
     value = row.get("rollout_path")
     if not isinstance(value, str) or not value:
         fail("rollout_missing", "Chat has no rollout path")
+    if os.name == "nt":
+        value = local_windows_path(value, "rollout_outside_home")
+        home = Path(local_windows_path(home, "rollout_outside_home")).resolve()
+        home = Path(local_windows_path(home, "rollout_outside_home"))
     path = Path(value).resolve()
+    if os.name == "nt":
+        path = Path(local_windows_path(path, "rollout_outside_home"))
     try:
         relative = path.relative_to(home)
     except ValueError:

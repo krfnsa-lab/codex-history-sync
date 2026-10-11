@@ -20,7 +20,7 @@ import tempfile
 import time
 
 VERSION = 1
-SOFTWARE_VERSION = '2.0.3'
+SOFTWARE_VERSION = '2.0.4'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
