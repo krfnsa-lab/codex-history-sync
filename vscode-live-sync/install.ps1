@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][Alias('ConfigPath')][string]$Config,
     [string]$Controller,
     [switch]$WhatIf

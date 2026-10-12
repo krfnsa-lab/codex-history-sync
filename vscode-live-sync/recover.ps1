@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][Alias('ConfigPath')][string]$Config, [string]$Controller)
+﻿param([Parameter(Mandatory=$true)][Alias('ConfigPath')][string]$Config, [string]$Controller)
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Common.ps1')
 $profile = Get-SyncProfile -ConfigPath $Config
