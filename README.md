@@ -49,6 +49,21 @@ Windows 任务计划程序按配置启动一次检查，处理完成就退出。
 
 已有聊天的更新会等待目标系统内的 Codex 进程关闭；检测为系统范围内的保守保护，包含桌面应用、扩展后台和 CLI。新聊天可以在目标后台运行时导入，源聊天须已静默。导入后，已打开的 VS Code 面板可能需要重新加载窗口或重新打开列表。
 
+## 可选：保持 WSL 窗口打开并自动刷新（预览版）
+
+`2.1.0-beta.1` 新增 [VS Code 同步桥](vscode-live-sync/README.md)。它默认关闭，不改变基础同步规则。启用后，在 Remote WSL 窗口中每分钟检查 Windows 已有聊天的更新；确认 Codex 空闲至少 60 秒后，暂停本窗口所属的后端、完成同步并自动重载窗口。
+
+正在回复、运行后台命令、有未保存文件、调试或多个 Codex 窗口时暂缓；同步异常时保留恢复保护。后台进程只随 Codex 插件运行，不安装新的常驻 Windows 服务。
+
+```powershell
+.\vscode-live-sync\install.ps1 -Config .\config.json -WhatIf
+.\vscode-live-sync\install.ps1 -Config .\config.json
+```
+
+然后在 Remote WSL 窗口按 F1，运行 **Codex History: Complete Setup and Enable**。可通过 **Disable and Restore Original Codex** 恢复原设置。安装器需要 Windows x64 Python（带 pip）及已安装的两端 Codex 扩展；安装步骤会启动选定 WSL。源代码下载后在使用者本机构建启动器，不分发含本机解释器路径的预编译 VSIX。
+
+这是预览功能，打开窗口时的自动补齐目前支持 **Windows → WSL**，不合并双边续聊。已验证隔离目录内的真实官方后端协议；实际前台聊天显示、未发送草稿在重载中的保留仍需验证。启用前发送或保存草稿。基础脚本的稳定版本仍是 `v2.0.4`。
+
 ## 配置与多个实例
 
 默认使用本目录的 `config.json`。公开的 `config.example.json` 是配置格式示例，示例 Linux 用户需要自行替换。推荐通过配置向导生成实际配置。

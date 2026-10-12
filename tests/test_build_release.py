@@ -16,6 +16,26 @@ spec.loader.exec_module(builder)
 
 
 class ReleaseBuildTests(unittest.TestCase):
+    def test_bridge_generated_binaries_and_personal_reports_are_never_read(self):
+        names = ('vscode-live-sync/dist/personal.vsix',
+                 'vscode-live-sync/vscode-extension/bin/windows/personal.exe',
+                 'vscode-live-sync/installation-result.json', 'vscode-live-sync/verification-result.json')
+        private = set()
+        for relative in names:
+            file = self.project / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('not public')
+            private.add(file)
+        original = Path.read_bytes
+        def checked(file):
+            if file in private:
+                raise AssertionError('Private generated artifact was read')
+            return original(file)
+        with mock.patch.object(Path, 'read_bytes', checked):
+            _, payload, _ = builder.collect_release_files(self.project)
+        self.assertTrue(builder.LIVE_SYNC_FILES.issubset(payload))
+        self.assertFalse(set(names) & set(payload))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

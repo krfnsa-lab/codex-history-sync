@@ -20,3 +20,10 @@ releases/
 *.zip.sha256
 SHA256SUMS
 SHA256SUMS.txt
+# Generated local VS Code bridge artifacts and diagnostics
+vscode-live-sync/dist/
+vscode-live-sync/vscode-extension/bin/windows/
+vscode-live-sync/installation-result.json
+vscode-live-sync/verification-result.json
+*.vsix
+*.exe

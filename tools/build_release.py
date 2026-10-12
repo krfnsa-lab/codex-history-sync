@@ -27,6 +27,17 @@ REQUIRED_FILES = frozenset((
     "tests/test_history_endpoint_review.py", "tests/test_history_sync_review.py",
 ))
 OPTIONAL_ROOT_FILES = frozenset(("CONTRIBUTING.md", "SECURITY.md", "VALIDATION.md"))
+LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (
+    'build_vsix.py', 'build_windows_launcher.py', 'gateway.py', 'install.py', 'install.ps1',
+    'linux_launcher.py', 'preview_sync.py', 'recover.py', 'recover.ps1', 'README.md', 'LICENSE',
+    'THIRD_PARTY_NOTICES.md', 'DISTLIB-LICENSE.txt', 'WINDOWS-LAUNCHER-LICENSE.txt',
+    'tests/test_preview.py', 'tests/test_gateway.py', 'tests/test_recovery.py',
+    'tests/test_windows_launcher.py', 'tests/native_smoke.py',
+    'tests/test_install_config.py',
+    'vscode-extension/package.json', 'vscode-extension/bridge.js', 'vscode-extension/extension.js',
+    'vscode-extension/README.md', 'vscode-extension/test/bridge.test.js', 'vscode-extension/test/extension.test.js',
+))
+REQUIRED_FILES = REQUIRED_FILES | LIVE_SYNC_FILES
 IGNORED_DIRECTORIES = frozenset((
     ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "runtime", "logs", "backups", ".history-sync-backups", "sessions",
@@ -65,7 +76,8 @@ def allowed_file(relative):
 def ignored_file(name):
     value = name.lower()
     return (value in PRIVATE_CONFIG_NAMES or value.startswith(".env")
-            or value.endswith((".pyc", ".pyo", ".log", ".tmp", ".bak", "~"))
+            or value.endswith((".pyc", ".pyo", ".log", ".tmp", ".bak", ".exe", ".vsix", "~"))
+            or value in ('installation-result.json', 'verification-result.json')
             or ".sqlite" in value or value in (".ds_store", "thumbs.db", "sha256sums", "sha256sums.txt"))
 
 

@@ -25,11 +25,13 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Run isolated Python tests
         run: python -B -m unittest discover -s tests -p "test_*.py" -q
+      - name: Run optional bridge Python tests
+        run: python -B -m unittest discover -s vscode-live-sync/tests -p "test_*.py" -q
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $files = Get-ChildItem -LiteralPath . -Filter *.ps1
+          $files = @(Get-ChildItem -LiteralPath . -Filter *.ps1) + @(Get-ChildItem -LiteralPath vscode-live-sync -Filter *.ps1)
           foreach ($file in $files) {
             $tokens = $null
             $parseErrors = $null
@@ -42,3 +44,15 @@ jobs:
         run: .\tests\test_powershell.ps1
       - name: Verify release contents
         run: python -B tools/build_release.py
+
+  bridge-javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run optional bridge coordinator and setup tests
+        run: node --test vscode-live-sync/vscode-extension/test/bridge.test.js vscode-live-sync/vscode-extension/test/extension.test.js
