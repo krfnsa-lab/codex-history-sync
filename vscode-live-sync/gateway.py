@@ -132,20 +132,19 @@ class Gateway:
         child = self.child
         if child is None or self.child_group_stopped:
             return True
-        # Only the process group created by this gateway is signalled.
+        # The child starts a new session. Code-mode helpers may create their
+        # own process groups inside it; stop only groups in that owned session.
         try:
             if not self.owned_group_live(child.pid):
                 await child.wait()
                 self.child_group_stopped = True
                 return True
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child.pid, signal.SIGTERM)
+            self.signal_owned_session(child.pid, signal.SIGTERM)
             deadline = time.monotonic() + self.shutdown_timeout
             while self.owned_group_live(child.pid) and time.monotonic() < deadline:
                 await asyncio.sleep(0.025)
             if self.owned_group_live(child.pid):
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
+                self.signal_owned_session(child.pid, signal.SIGKILL)
             await child.wait()
             deadline = time.monotonic() + 1
             while self.owned_group_live(child.pid) and time.monotonic() < deadline:
@@ -160,23 +159,37 @@ class Gateway:
             return False
 
     @staticmethod
-    def owned_group_live(group_pid):
-        """Confirm owned process-group exit even when its original leader hit EOF."""
+    def owned_session_groups(session_pid):
+        """The kernel session ID remains owned while its descendants survive."""
+        groups = set()
         for entry in Path("/proc").iterdir():
             if not entry.name.isdecimal():
                 continue
             try:
                 uid = entry.stat().st_uid
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[2]) != group_pid or fields[0] == "Z":
+                if int(fields[3]) != session_pid or fields[0] == "Z":
                     continue
                 # Unexpected ownership/session cannot count as a confirmed exit.
-                if uid != os.getuid() or int(fields[3]) != group_pid:
-                    raise PermissionError("owned process-group validation failed")
-                return True
+                if uid != os.getuid() or int(fields[2]) <= 1:
+                    raise PermissionError("owned session validation failed")
+                groups.add(int(fields[2]))
             except (FileNotFoundError, ProcessLookupError):
                 continue
-        return False
+        return groups
+
+    @classmethod
+    def owned_group_live(cls, group_pid):
+        return bool(cls.owned_session_groups(group_pid))
+
+    @classmethod
+    def signal_owned_session(cls, session_pid, sig):
+        for group in cls.owned_session_groups(session_pid):
+            # Recheck membership before each signal; another process's group
+            # must never be selected merely because its executable is Codex.
+            if group in cls.owned_session_groups(session_pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(group, sig)
 
     async def control(self, reader, writer):
         try:

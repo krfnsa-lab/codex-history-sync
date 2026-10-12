@@ -44,6 +44,47 @@ test('reject malformed paths before any process starts', () => {
   assert.throws(() => validateConfig({ stateDir: '/tmp/state', windowsPython: '/mnt/c/python.exe', windowsController: 'relative.py' }));
 });
 
+test('family proof belonging to another native backend cannot pause this window', async t => {
+  const f = await fixture(t, {
+    runWindows: async () => ({ eligible: true, candidate_ids: ['synthetic'], native_backend_pid: 300 }),
+    request: async () => ({ ok: true, state: { busy: false, child_pid: 400, idle_seconds: 120 } })
+  });
+  const result = await f.coordinator.check();
+  assert.equal(result.reason, 'instances_changed');
+  assert.equal(f.calls.includes('sync'), false);
+  assert.equal(f.calls.includes('reload'), false);
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+});
+
+test('a verified family still waits while its own backend is busy', async t => {
+  const f = await fixture(t, {
+    runWindows: async () => ({ eligible: true, candidate_ids: ['synthetic'], native_backend_pid: 300 }),
+    request: async () => ({ ok: true, state: { busy: true, child_pid: 300, idle_seconds: 120 } })
+  });
+  assert.equal((await f.coordinator.check()).reason, 'codex_busy');
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+});
+
+test('a verified idle family belonging to this window uses normal guarded import', async t => {
+  const f = await fixture(t);
+  const originalRequest = f.coordinator.request;
+  const originalRun = f.coordinator.runWindows;
+  f.coordinator.request = async (...args) => {
+    const value = await originalRequest(...args);
+    if (value.state) value.state.child_pid = 300;
+    return value;
+  };
+  f.coordinator.runWindows = async (...args) => {
+    const value = await originalRun(...args);
+    if (args[1] === true) value.native_backend_pid = 300;
+    return value;
+  };
+  assert.equal((await f.coordinator.check()).kind, 'synced');
+  assert.ok(f.calls.includes('prepare_pause'));
+  assert.ok(f.calls.includes('sync'));
+  assert.ok(f.calls.includes('reload'));
+});
+
 test('no eligible updates never pauses or reloads', async t => {
   const f = await fixture(t, { runWindows: async () => ({ eligible: false, candidate_ids: [], reason: 'no_pending_updates' }) });
   assert.equal((await f.coordinator.check()).kind, 'current');

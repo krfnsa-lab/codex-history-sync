@@ -2,7 +2,7 @@
   "name": "codex-history-live-sync",
   "displayName": "Codex History Live Sync (Preview)",
   "description": "Coordinates idle WSL history imports and a VS Code window reload.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "krfnsa-lab",
   "license": "MIT",
   "engines": { "vscode": "^1.90.0" },

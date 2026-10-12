@@ -125,7 +125,7 @@ function describeResult(result) {
     editor_not_idle: '编辑器有未保存内容或正在调试，此次未同步。',
     check_running: '已有同步检查正在进行，请等待本轮结束。',
     retry_backoff: '上次未传输记录，正在等待重试时间。此次没有同步。',
-    other_native_backends: '检测到多个 Codex 后端，请只保留一个 WSL Codex 窗口后重试。',
+    other_native_backends: '检测到其他独立或无法确认归属的 Codex 进程，同步暂缓。这不一定表示打开了多个 VS Code 窗口。',
     multiple_windows: '检测到多个同步桥窗口，此次未同步。请只保留一个 WSL Codex 窗口。',
     other_window: '同步桥属于另一个 VS Code 窗口，此次未同步。请在该窗口触发检查。',
     codex_busy: 'Codex 正在处理请求或尚未空闲 60 秒，此次未同步。',
@@ -193,6 +193,10 @@ class Coordinator {
       if (!Number.isInteger(instances[0].parent_pid) || instances[0].parent_pid !== process.pid) return { kind: 'waiting', reason: 'other_window', preview };
       for (const instance of instances) {
         const status = await this.request(instance, 'status');
+        if (preview.native_backend_pid !== undefined &&
+            (!Number.isInteger(preview.native_backend_pid) || status.state?.child_pid !== preview.native_backend_pid)) {
+          return { kind: 'waiting', reason: 'instances_changed', preview };
+        }
         if (!status.ok || !status.state || status.state.busy || status.state.starting || status.state.paused ||
             status.state.pending_request_count || status.state.server_request_count || status.state.active_turn_count || status.state.known_activity_count ||
             !Number.isFinite(status.state.idle_seconds) || status.state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview };

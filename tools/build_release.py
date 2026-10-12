@@ -35,6 +35,7 @@ LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (
     'tests/test_windows_launcher.py', 'tests/native_smoke.py',
     'tests/test_install_config.py',
     'native_local_probe.py', 'tests/test_native_local_probe.py',
+    'native_backend_probe.py', 'tests/test_native_backend_probe.py',
     'vscode-extension/package.json', 'vscode-extension/bridge.js', 'vscode-extension/extension.js',
     'vscode-extension/README.md', 'vscode-extension/test/bridge.test.js', 'vscode-extension/test/extension.test.js',
 ))

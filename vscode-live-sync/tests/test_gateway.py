@@ -29,6 +29,11 @@ for raw in sys.stdin:
  if method=='leave-descendant-and-exit':
   descendant=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   send({'id':identifier,'result':{'descendant_pid':descendant.pid}});sys.exit()
+ if method in ('leave-separated-group-and-exit','spawn-separated-group'):
+  descendant=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],process_group=0,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  send({'id':identifier,'result':{'descendant_pid':descendant.pid}})
+  if method=='leave-separated-group-and-exit':sys.exit()
+  continue
  if method=='exit':sys.exit()
  if method=='ignore-term':signal.signal(signal.SIGTERM,signal.SIG_IGN)
  if method=='release':
@@ -249,6 +254,29 @@ class GatewayIntegration(unittest.TestCase):
         self.launch();self.ready()
         self.send('exit');self.process.wait(timeout=3)
         self.assertFalse(list((self.state_dir/'instances').glob('*.json')))
+
+    def test_owned_separate_group_is_cleaned_after_native_eof(self):
+        self.launch();self.ready()
+        descendant=self.response(self.send('leave-separated-group-and-exit'))['result']['descendant_pid']
+        self.process.wait(timeout=3)
+        def stopped():
+            try:return (Path('/proc')/str(descendant)/'stat').read_text().rsplit(')',1)[1].split()[0]=='Z'
+            except FileNotFoundError:return True
+        self.wait(stopped)
+
+    def test_pause_stops_owned_worker_group_and_preserves_unrelated_session(self):
+        unrelated=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+        try:
+            self.launch();self.ready()
+            descendant=self.response(self.send('spawn-separated-group'))['result']['descendant_pid']
+            self.global_pause();self.assertTrue(self.control('prepare_pause')['ok'])
+            def stopped():
+                try:return (Path('/proc')/str(descendant)/'stat').read_text().rsplit(')',1)[1].split()[0]=='Z'
+                except FileNotFoundError:return True
+            self.wait(stopped)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate();unrelated.wait(timeout=3)
 
     def test_unknown_sdk_status_and_tool_are_conservatively_busy(self):
         self.launch();self.ready();self.global_pause()

@@ -304,6 +304,27 @@ def sync_once(controller, config_path):
         return result
 
 
+def call_backend_family_probe(sync, config):
+    if not sync.wsl_running(config['wsl_distro']):
+        return {'verified_family': False, 'reason': 'wsl_stopped'}
+    helper = Path(__file__).resolve().with_name('native_backend_probe.py')
+    command = ['wsl.exe', '-d', config['wsl_distro'], '-u', config['wsl_user'], '--exec',
+               config.get('python_wsl', '/usr/bin/python3'), sync.linux_mount_path(helper)]
+    result = subprocess.run(command, capture_output=True, timeout=30,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:
+        return {'verified_family': False, 'reason': 'process_scan_failed'}
+    return json.loads(sync.decode_output(result.stdout))
+
+
+def accepted_backend_family(wsl, family):
+    return (type(wsl.get('backend_count')) is int and wsl['backend_count'] > 1
+            and family.get('verified_family') is True and family.get('app_server_count') == 1
+            and type(family.get('app_server_pid')) is int and family['app_server_pid'] > 0
+            and family.get('process_count') == wsl.get('backend_count')
+            and family.get('helper_count') == wsl.get('backend_count') - 1)
+
+
 def probe(controller, config_path):
     if os.name != 'nt':
         raise RuntimeError('Run this probe with native Windows Python')
@@ -321,8 +342,12 @@ def probe(controller, config_path):
     # A running ordinary task can import directly without a VS Code reload.
     if not wsl.get('backend_running'):
         return {'eligible': False, 'candidate_ids': [], 'reason': 'native_sync_can_run'}
+    family = None
     if wsl.get('backend_count') != 1:
-        return {'eligible': False, 'candidate_ids': [], 'reason': 'other_native_backends'}
+        family = call_backend_family_probe(sync, config)
+        if not accepted_backend_family(wsl, family):
+            return {'eligible': False, 'candidate_ids': [], 'reason': 'other_native_backends',
+                    'backend_count': wsl.get('backend_count'), 'process_reason': family.get('reason')}
     ledger = json.loads((runtime / 'ledger.json').read_text(encoding='utf-8'))
     if ledger.get('version') != sync.VERSION or not isinstance(ledger.get('threads'), dict):
         raise RuntimeError('Unsupported ledger')
@@ -331,6 +356,9 @@ def probe(controller, config_path):
     summary = classify_plan(sync, windows, wsl, virtual, config.get('quiet_seconds', 60))
     summary['needs_reconciliation_ids'] = sorted(proofs)
     summary['local_settings_reconciliation_count'] = len(proofs)
+    if family is not None:
+        summary['native_backend_pid'] = family['app_server_pid']
+        summary['owned_helper_count'] = family['helper_count']
     return {**summary,
             'wsl_distro': config['wsl_distro'], 'runtime_directory': str(runtime),
             'operation_timeout_seconds': config.get('operation_timeout_seconds', 120),
