@@ -79,7 +79,8 @@ def install(config_path, dry_run=False, controller_path=None):
         return
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
-    vsix = package(ROOT / 'dist/codex-history-live-sync-0.1.1.vsix')
+    shutil.copy2(ROOT / 'native_local_probe.py', destination / 'native_local_probe.py')
+    vsix = package(ROOT / 'dist/codex-history-live-sync-0.1.2.vsix')
     shutil.copy2(ROOT / 'vscode-extension/bin/windows/codex-history-sync-bridge.exe', wrapper)
     manifest.write_text(json.dumps({'owner': OWNER, 'binary': max(native)[1]}, indent=2), encoding='utf-8')
     setup = {'windowsPython': mount(python), 'windowsController': str(controller), 'windowsConfig': str(config_path),

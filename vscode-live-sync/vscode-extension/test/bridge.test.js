@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { Coordinator, validateConfig, runWindows } = require('../bridge');
+const { Coordinator, validateConfig, runWindows, describeResult } = require('../bridge');
 
 test('missing Windows helper reports an actionable error without revealing paths', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-missing-helper-'));
@@ -45,8 +45,67 @@ test('reject malformed paths before any process starts', () => {
 });
 
 test('no eligible updates never pauses or reloads', async t => {
-  const f = await fixture(t, { runWindows: async () => ({ eligible: false, candidate_ids: [] }) });
+  const f = await fixture(t, { runWindows: async () => ({ eligible: false, candidate_ids: [], reason: 'no_pending_updates' }) });
   assert.equal((await f.coordinator.check()).kind, 'current');
+  assert.deepEqual(f.calls, []);
+});
+
+test('conflict and blocked previews preserve their reason without pausing', async t => {
+  for (const [reason, kind] of [['chat_conflict', 'conflict'], ['pending_import', 'blocked'], ['chat_busy', 'waiting'], ['other_native_backends', 'waiting'], ['baseline_missing', 'blocked']]) {
+    const preview = { eligible: false, candidate_ids: [], reason, blocked_reason_counts: { both_sides_changed: 1 } };
+    const f = await fixture(t, { runWindows: async () => preview });
+    const result = await f.coordinator.check();
+    assert.equal(result.kind, kind);
+    assert.equal(result.reason, reason);
+    assert.equal(result.preview, preview);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('an old or malformed preview cannot claim that records are current', async t => {
+  for (const preview of [{ eligible: false }, { eligible: false, reason: 'nothing_ready' }, { eligible: true, candidate_ids: [] }]) {
+    const f = await fixture(t, { runWindows: async () => preview });
+    assert.equal((await f.coordinator.check()).kind, 'blocked');
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('status explains conflict and waiting without a success check mark', () => {
+  const conflict = describeResult({ kind: 'conflict', reason: 'chat_conflict', preview: { blocked_reason_counts: { both_sides_changed: 1 } } });
+  assert.match(conflict.text, /未同步.*聊天冲突/);
+  assert.equal(conflict.warning, true);
+  assert.match(conflict.detail, /保留两端/);
+  for (const reason of ['dirty_editor', 'debugging', 'codex_busy']) {
+    const waiting = describeResult({ kind: 'waiting', reason });
+    assert.match(waiting.text, /等待空闲.*未同步/);
+    assert.ok(!waiting.text.includes('$(check)'));
+    assert.ok(waiting.detail);
+  }
+  const current = describeResult({ kind: 'current', reason: 'no_pending_updates' });
+  assert.match(current.text, /没有待同步更新/);
+  assert.ok(!current.text.includes('$(check)'));
+});
+
+test('only a positive actual transfer count may display synchronized', () => {
+  for (const transferred of [0, undefined, -1, 1.5, '1']) {
+    const value = describeResult({ kind: 'synced', result: { transferred } });
+    assert.ok(!value.text.includes('已同步'));
+    assert.ok(!value.text.includes('$(check)'));
+  }
+  const value = describeResult({ kind: 'synced', result: { transferred: 2 }, preview: { conflict_count: 1 } });
+  assert.match(value.text, /部分已同步.*仍有冲突/);
+  assert.match(value.detail, /实际同步 2 条/);
+  assert.equal(value.warning, true);
+});
+
+test('dirty, debugging and retry delays retain distinct waiting explanations', async t => {
+  for (const reason of ['dirty_editor', 'debugging']) {
+    const f = await fixture(t, { canReload: () => false, reloadBlockReason: () => reason });
+    assert.equal((await f.coordinator.check()).reason, reason);
+    assert.deepEqual(f.calls, []);
+  }
+  const f = await fixture(t, { nextAttemptAt: () => Date.now() + 10000 });
+  assert.equal((await f.coordinator.check()).reason, 'retry_backoff');
   assert.deepEqual(f.calls, []);
 });
 

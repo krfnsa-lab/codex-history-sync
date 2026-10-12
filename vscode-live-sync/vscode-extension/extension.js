@@ -3,7 +3,7 @@ const vscode = require('vscode');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { Coordinator, validateConfig, readPrivateJson, runWindows } = require('./bridge');
+const { Coordinator, validateConfig, readPrivateJson, runWindows, describeResult } = require('./bridge');
 let timer; let coordinator; let status; let lastError = '';
 let extensionContext;
 let setupInProgress = false;
@@ -125,6 +125,11 @@ function settings() {
 }
 
 function isWsl() { return process.platform === 'linux' && vscode.env.remoteName === 'wsl'; }
+function reloadBlockReason() {
+  if (vscode.debug.activeDebugSession) return 'debugging';
+  if (vscode.workspace.textDocuments.some(document => document.isDirty)) return 'dirty_editor';
+  return 'editor_not_idle';
+}
 function canReload() {
   return !vscode.debug.activeDebugSession && !vscode.workspace.textDocuments.some(document => document.isDirty);
 }
@@ -133,8 +138,13 @@ async function check(manual = false) {
   if (!coordinator) return;
   try {
     const result = await coordinator.check();
-    status.text = result.kind === 'waiting' ? '$(history) Codex：等待下次同步' : result.kind === 'unavailable' ? '$(history) Codex：尚未连接' : result.kind === 'synced' ? '$(check) Codex：新记录已同步' : '$(check) Codex：记录已检查';
-    status.tooltip = 'Windows 与 WSL 的聊天记录同步'; lastError = '';
+    const presentation = describeResult(result);
+    status.text = presentation.text;
+    status.tooltip = presentation.detail; lastError = '';
+    if (manual) {
+      if (presentation.warning) await vscode.window.showWarningMessage(presentation.detail);
+      else await vscode.window.showInformationMessage(presentation.detail);
+    }
   } catch (error) {
     status.text = '$(warning) Codex：同步待处理';
     status.tooltip = error.message;
@@ -156,6 +166,7 @@ function configure() {
     validateConfig(config);
     coordinator = new Coordinator(config, {
       canReload,
+      reloadBlockReason,
       nextAttemptAt: () => extensionContext.globalState.get('nextAttemptAt', 0),
       onDeferred: value => extensionContext.globalState.update('nextAttemptAt', value),
       reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
