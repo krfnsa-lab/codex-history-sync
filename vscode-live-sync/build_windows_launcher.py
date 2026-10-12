@@ -10,11 +10,18 @@ MAIN = '''import os, subprocess, sys, json
 from pathlib import Path
 binary = os.environ.get("CODEX_HISTORY_SYNC_REAL_CLI")
 if not binary or not os.path.isfile(binary):
-    config_path = Path(os.environ.get("LOCALAPPDATA", "")) / "CodexHistorySyncLive" / "launcher.json"
-    try:
-        binary = json.loads(config_path.read_text(encoding="utf-8"))["binary"]
-    except (OSError, ValueError, KeyError):
-        binary = None
+    binary = None
+    config_paths = [Path.home() / ".codex-history-sync-live" / "launcher.json"]
+    if os.environ.get("LOCALAPPDATA"):
+        config_paths.append(Path(os.environ["LOCALAPPDATA"]) / "CodexHistorySyncLive" / "launcher.json")
+    for config_path in config_paths:
+        try:
+            candidate = json.loads(config_path.read_text(encoding="utf-8"))["binary"]
+            if isinstance(candidate, str) and os.path.isfile(candidate):
+                binary = candidate
+                break
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
 if not binary or not os.path.isfile(binary):
     candidates = []
     for package in (Path.home() / ".vscode" / "extensions").glob("openai.chatgpt-*/package.json"):

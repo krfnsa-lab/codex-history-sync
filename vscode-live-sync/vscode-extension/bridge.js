@@ -91,7 +91,15 @@ async function runWindows(config, mode) {
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
     });
     return JSON.parse(stdout.trim());
-  } catch { throw new Error(mode === 'recovery' ? 'Could not verify safe backend recovery.' : mode === true ? 'Could not check the synchronizer.' : 'The synchronizer did not finish.'); }
+  } catch (error) {
+    // Do not expose arbitrary stderr, arguments, or user paths in notifications.
+    if (error.code === 2 && /can't open file/i.test(String(error.stderr || ''))) {
+      throw new Error('无法读取 Windows 同步脚本，请重新安装同步桥以修复路径。');
+    }
+    if (error.code === 'ENOENT') throw new Error('找不到 Windows Python，请检查同步桥的解释器配置。');
+    if (error.killed) throw new Error('同步检查超时，已保留原记录；请稍后重试。');
+    throw new Error(mode === 'recovery' ? '无法确认同步恢复状态，暂停保护已保留。' : mode === true ? '同步检查未完成，请检查安装路径及配置。' : '同步未完成，请检查恢复记录。');
+  }
 }
 
 function sameInstances(left, right) {

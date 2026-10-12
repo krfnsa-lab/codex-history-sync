@@ -13,6 +13,17 @@ from preview_sync import load_controller
 ROOT = Path(__file__).resolve().parent
 OWNER = 'krfnsa-lab.codex-history-live-sync'
 
+def owned_manifest(path):
+    try:
+        return json.loads(path.read_text(encoding='utf-8')).get('owner') == OWNER
+    except (OSError, ValueError, AttributeError):
+        return False
+
+def windows_destination():
+    # MSIX apps can virtualize LocalAppData; the user profile is shared with
+    # ordinary VS Code processes and the native WSL interop launcher.
+    return Path.home() / '.codex-history-sync-live'
+
 def mount(path):
     path = Path(path).resolve()
     if len(path.drive) != 2 or not path.drive[0].isalpha():
@@ -46,13 +57,15 @@ def install(config_path, dry_run=False, controller_path=None):
     distro, user = config['wsl_distro'], config['wsl_user']
     if any(any(c in str(value) for c in '%&|<>^!\r\n') for value in (code, ROOT, distro)):
         raise RuntimeError('VS Code CLI installation requires paths without shell metacharacters')
-    destination = Path(os.environ['LOCALAPPDATA']) / 'CodexHistorySyncLive'
+    destination = windows_destination()
     windows_apps = Path(os.environ['LOCALAPPDATA']) / 'Microsoft/WindowsApps'
     if str(windows_apps).casefold() not in [p.rstrip('\\/').casefold() for p in os.environ.get('PATH', '').split(';')]:
         raise RuntimeError('WindowsApps is not on PATH; installation cannot prove startup resolution')
     wrapper = windows_apps / 'codex-history-sync-bridge.exe'
     manifest = destination / 'launcher.json'
-    if wrapper.exists() and (not manifest.is_file() or json.loads(manifest.read_text()).get('owner') != OWNER):
+    legacy_manifest = Path(os.environ['LOCALAPPDATA']) / 'CodexHistorySyncLive/launcher.json'
+    owned = owned_manifest(manifest) or (not manifest.exists() and owned_manifest(legacy_manifest))
+    if wrapper.exists() and not owned:
         raise RuntimeError('An unrelated Windows launcher already uses this name')
     native = []
     for candidate in (Path.home() / '.vscode/extensions').glob('openai.chatgpt-*/bin/windows-x86_64/codex.exe'):
@@ -66,7 +79,7 @@ def install(config_path, dry_run=False, controller_path=None):
         return
     destination.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
-    vsix = package(ROOT / 'dist/codex-history-live-sync-0.1.0.vsix')
+    vsix = package(ROOT / 'dist/codex-history-live-sync-0.1.1.vsix')
     shutil.copy2(ROOT / 'vscode-extension/bin/windows/codex-history-sync-bridge.exe', wrapper)
     manifest.write_text(json.dumps({'owner': OWNER, 'binary': max(native)[1]}, indent=2), encoding='utf-8')
     setup = {'windowsPython': mount(python), 'windowsController': str(controller), 'windowsConfig': str(config_path),

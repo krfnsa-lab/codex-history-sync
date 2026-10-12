@@ -45,8 +45,46 @@ class InstallerConfiguration(unittest.TestCase):
                     installer.install(config, dry_run=True)
                 plan = json.loads(captured.getvalue())
                 self.assertFalse(plan['automatic_sync_enabled'])
+                self.assertEqual(plan['windows_install'], str(fake_home / '.codex-history-sync-live'))
+                self.assertFalse((fake_home / '.codex-history-sync-live').exists())
                 self.assertFalse((appdata / 'CodexHistorySyncLive').exists())
                 self.assertFalse((windows_apps / 'codex-history-sync-bridge.exe').exists())
                 self.assertFalse((profile_dir / 'history_sync.py').exists())
+
+    def test_legacy_owner_allows_preview_upgrade_but_unrelated_new_manifest_blocks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            temporary = Path(folder).resolve()
+            fake_home = temporary / 'example-user'
+            binary = fake_home / '.vscode/extensions/openai.chatgpt-synthetic/bin/windows-x86_64/codex.exe'
+            binary.parent.mkdir(parents=True); binary.write_bytes(b'synthetic')
+            appdata = temporary / 'appdata'
+            windows_apps = appdata / 'Microsoft/WindowsApps'
+            windows_apps.mkdir(parents=True)
+            (windows_apps / 'codex-history-sync-bridge.exe').write_bytes(b'owned-legacy-wrapper')
+            legacy = appdata / 'CodexHistorySyncLive/launcher.json'
+            legacy.parent.mkdir(); legacy.write_text(json.dumps({'owner': installer.OWNER}))
+            config = temporary / 'config.json'
+            config.write_text(json.dumps({'windows_home':str(temporary), 'wsl_distro':'Synthetic',
+                'wsl_user':'example-user', 'wsl_home':'/home/example-user/.codex',
+                'python_windows':sys.executable, 'python_wsl':'/usr/bin/python3'}))
+            env = {'LOCALAPPDATA':str(appdata), 'PATH':str(windows_apps)}
+            with patch.dict(os.environ, env), patch.object(Path, 'home', return_value=fake_home), \
+                 patch.object(installer.shutil, 'which', return_value='C:\\Tools\\code.cmd'), \
+                 patch.object(installer, 'run', side_effect=AssertionError('Preview launched a process')), \
+                 contextlib.redirect_stdout(io.StringIO()) as captured:
+                installer.install(config, dry_run=True)
+                new_manifest = fake_home / '.codex-history-sync-live/launcher.json'
+                new_manifest.parent.mkdir(); new_manifest.write_text(json.dumps({'owner': 'someone-else'}))
+                with self.assertRaisesRegex(RuntimeError, 'unrelated Windows launcher'):
+                    installer.install(config, dry_run=True)
+            self.assertEqual(json.loads(captured.getvalue())['windows_install'], str(new_manifest.parent))
+            self.assertEqual(json.loads(legacy.read_text())['owner'], installer.OWNER)
+
+    def test_malformed_manifest_is_not_owned(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = Path(folder) / 'launcher.json'
+            for contents in ('invalid-json', 'null', '[]', '{"owner":"unrelated"}'):
+                manifest.write_text(contents)
+                self.assertFalse(installer.owned_manifest(manifest))
 
 if __name__ == '__main__': unittest.main()

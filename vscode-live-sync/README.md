@@ -29,7 +29,9 @@
 
 本机生成的 EXE/VSIX包含当前 Python 的安装路径，应在使用者机器上重新构建；开源时分发源代码。
 
-安装位置：Windows 用户 LocalAppData 下的 `CodexHistorySyncLive` 和 WindowsApps 启动器；WSL 用户的 `.config/codex-history-sync-live`、`.local/share/codex-history-sync-live`、`.local/state/cdx-live`，以及 `/usr/local/bin/codex-history-sync-bridge`。官方插件文件不被修改。
+安装位置：Windows 用户主目录下的 `.codex-history-sync-live` 和 WindowsApps 启动器；WSL 用户的 `.config/codex-history-sync-live`、`.local/share/codex-history-sync-live`、`.local/state/cdx-live`，以及 `/usr/local/bin/codex-history-sync-bridge`。用户主目录避免 Codex 桌面版的 MSIX LocalAppData 隔离，让 VS Code 和 WSL 能读取同一份检查脚本。官方插件文件不被修改。
+
+从同步桥 0.1.0 升级时，重新运行安装器，然后在 WSL 窗口执行 **Codex History: Complete Setup and Enable**，更新保存的检查脚本路径。安装器识别原有启动器的归属；旧 LocalAppData 文件保留，启动器优先读取新的用户主目录配置。
 
 ## 关闭与异常恢复
 

@@ -4,7 +4,16 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { Coordinator, validateConfig } = require('../bridge');
+const { Coordinator, validateConfig, runWindows } = require('../bridge');
+
+test('missing Windows helper reports an actionable error without revealing paths', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-missing-helper-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, 'fake-python');
+  await fs.writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "python.exe: can\'t open file synthetic-private-path: [Errno 2]" >&2\nexit 2\n', { mode: 0o700 });
+  const config = { windowsPython: executable, previewHelper: 'C:\\Sync\\missing.py', windowsController: 'C:\\Sync\\history_sync.py', windowsConfig: 'C:\\Sync\\config.json' };
+  await assert.rejects(runWindows(config, true), error => error.message.includes('重新安装同步桥') && !error.message.includes('synthetic-private-path'));
+});
 
 async function fixture(t, changes = {}) {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-live-test-'));
