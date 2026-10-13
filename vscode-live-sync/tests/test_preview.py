@@ -110,6 +110,40 @@ class PreviewTests(unittest.TestCase):
         result=preview.classify_plan(sync,a,b,ledger,60)
         self.assertEqual(result['reason'],'no_pending_updates')
 
+    def longer_inputs(self, winning_side):
+        a,b,ledger=self.inputs()
+        b['threads'][0].update(revision='wsl-after',content_revision='wsl-after-body')
+        a['backend_running']=True
+        for side,view in [('windows',a),('wsl',b)]:
+            view['threads'][0].update(turn_count=5 if side==winning_side else 3,
+                                     item_count=8 if side==winning_side else 20)
+        return a,b,ledger
+
+    def test_longer_windows_version_can_use_normal_pause_candidate(self):
+        a,b,ledger=self.longer_inputs('windows')
+        result=preview.classify_plan(sync,a,b,ledger,60,'prefer_longer')
+        self.assertTrue(result['eligible'])
+        self.assertEqual(result['conflict_count'],0)
+        self.assertEqual(result['conflict_decisions'][0]['source'],'windows')
+        self.assertTrue(b['backend_running'])
+
+    def test_longer_wsl_version_waits_for_windows_backend_without_reload_candidate(self):
+        a,b,ledger=self.longer_inputs('wsl')
+        result=preview.classify_plan(sync,a,b,ledger,60,'prefer_longer')
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'],'longer_wsl_pending')
+        self.assertEqual(result['conflict_count'],0)
+        self.assertEqual(result['opposite_direction_count'],1)
+        self.assertEqual(result['conflict_decisions'][0]['source'],'wsl')
+
+    def test_equal_counts_under_prefer_longer_remain_a_conflict(self):
+        a,b,ledger=self.longer_inputs('windows')
+        b['threads'][0].update(turn_count=5,item_count=8)
+        result=preview.classify_plan(sync,a,b,ledger,60,'prefer_longer')
+        self.assertFalse(result['eligible'])
+        self.assertEqual(result['reason'],'chat_conflict')
+        self.assertEqual(result['blocked_reason_counts'],{'conflict_counts_equal':1})
+
     def local_inputs(self):
         a,b,ledger=self.inputs()
         b['threads'][0]['revision']='wsl-settings-after'

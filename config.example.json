@@ -9,6 +9,7 @@
   "task_name": "CodexHistorySync-Public",
   "interval_minutes": 5,
   "quiet_seconds": 60,
+  "conflict_resolution": "manual",
   "max_transfers_per_run": 10,
   "run_budget_seconds": 120,
   "operation_timeout_seconds": 120,

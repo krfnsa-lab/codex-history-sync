@@ -6,6 +6,39 @@ const path = require('node:path');
 const os = require('node:os');
 const { Coordinator, validateConfig, runWindows, describeResult } = require('../bridge');
 
+test('a longer WSL winner explains waiting for the desktop backend without pausing', async t => {
+  const f = await fixture(t, { runWindows: async () => ({ eligible: false, reason: 'longer_wsl_pending', conflict_resolution: 'prefer_longer' }) });
+  const result = await f.coordinator.check();
+  assert.equal(result.kind, 'waiting');
+  assert.equal(f.calls.includes('prepare_pause'), false);
+  assert.equal(f.calls.includes('reload'), false);
+  const display = describeResult(result);
+  assert.match(display.detail, /已选择 WSL/);
+  assert.match(display.detail, /桌面端 Codex 后端停止/);
+  assert.doesNotMatch(display.text, /已同步/);
+});
+
+test('equal or unverifiable longer choices keep conflicts and successful choices report backups', () => {
+  const conflict = describeResult({ kind: 'conflict', reason: 'chat_conflict', preview: { conflict_resolution: 'prefer_longer' } });
+  assert.match(conflict.detail, /数量相同/);
+  assert.match(conflict.detail, /未自动选择/);
+  const success = describeResult({ kind: 'synced', result: { transferred: 1, resolved_conflicts: 1 }, preview: { conflict_count: 0 } });
+  assert.match(success.detail, /被替换的版本已备份/);
+});
+
+test('busy selected histories report a chosen version while waiting', () => {
+  const display = describeResult({ kind: 'waiting', reason: 'chat_busy', preview: {
+    conflict_resolution: 'prefer_longer', conflict_decisions: [
+      { source: 'windows', waiting_reason: 'source_busy' },
+      { source: 'wsl', waiting_reason: 'target_backend_running' }
+    ]
+  } });
+  assert.match(display.text, /已选较多记录/);
+  assert.match(display.detail, /Windows 1 条；WSL 1 条/);
+  assert.match(display.detail, /等待桌面端后端停止/);
+  assert.doesNotMatch(display.text, /已同步/);
+});
+
 test('missing Windows helper reports an actionable error without revealing paths', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-missing-helper-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

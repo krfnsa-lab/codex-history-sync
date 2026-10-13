@@ -25,6 +25,7 @@ REQUIRED_FILES = frozenset((
     "docs/SAFETY.md", "docs/CONFIGURATION.md", ".github/workflows/ci.yml",
     "tools/build_release.py", "tests/test_endpoint.py", "tests/test_diagnostics.py",
     "tests/test_history_endpoint_review.py", "tests/test_history_sync_review.py",
+    "tests/test_prefer_longer.py", "tests/test_prefer_longer_backup.py",
 ))
 OPTIONAL_ROOT_FILES = frozenset(("CONTRIBUTING.md", "SECURITY.md", "VALIDATION.md"))
 LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (

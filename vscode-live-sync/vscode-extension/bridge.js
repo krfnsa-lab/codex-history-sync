@@ -111,7 +111,7 @@ function previewResult(preview) {
   const reason = preview?.reason || 'unknown_preview_state';
   const kind = reason === 'chat_conflict' ? 'conflict'
     : reason === 'no_pending_updates' ? 'current'
-    : ['chat_busy', 'other_native_backends', 'native_sync_can_run', 'new_chats_pending', 'opposite_direction_pending', 'wsl_stopped'].includes(reason) ? 'waiting'
+    : ['chat_busy', 'other_native_backends', 'native_sync_can_run', 'new_chats_pending', 'opposite_direction_pending', 'longer_wsl_pending', 'wsl_stopped'].includes(reason) ? 'waiting'
     : 'blocked';
   return { kind, reason, preview };
 }
@@ -136,6 +136,7 @@ function describeResult(result) {
     native_sync_can_run: '当前未连接 Codex 后端，请等待定时同步或运行基础同步脚本。',
     new_chats_pending: '有新聊天待导入；当前窗口自动补齐只处理已有聊天，请通过基础同步导入。',
     opposite_direction_pending: '有 WSL → Windows 更新待同步；请等待 Windows Codex 空闲并停止后端后使用基础同步。',
+    longer_wsl_pending: '已选择 WSL 中聊天更多的一端。等待桌面端 Codex 后端停止后，定时任务会先备份旧版本，再同步到 Windows。',
     wsl_stopped: 'WSL 未运行，此次未同步。',
     baseline_missing: '缺少同步基线，此次未同步。请先初始化基础同步器。',
     pending_import: '存在未完成的导入，此次未同步。请先检查恢复记录。',
@@ -147,7 +148,7 @@ function describeResult(result) {
   if (result.kind === 'synced' && Number.isInteger(result.result?.transferred) && result.result.transferred > 0) {
     const conflicts = Number.isInteger(result.preview?.conflict_count) && result.preview.conflict_count > 0 ? result.preview.conflict_count : 0;
     return { text: conflicts ? '$(warning) Codex：部分已同步，仍有冲突' : '$(check) Codex：新记录已同步',
-      detail: `本轮实际同步 ${result.result.transferred} 条聊天。` + (conflicts ? `另有 ${conflicts} 条聊天存在冲突，已保留两端记录。` : ''), warning: conflicts > 0 };
+      detail: `本轮实际同步 ${result.result.transferred} 条聊天。` + (result.result.resolved_conflicts > 0 ? `其中 ${result.result.resolved_conflicts} 条按聊天数量选择版本，被替换的版本已备份。` : '') + (conflicts ? `另有 ${conflicts} 条聊天存在冲突，已保留两端记录。` : ''), warning: conflicts > 0 };
   }
   const text = result.kind === 'conflict' ? '$(warning) Codex：未同步，聊天冲突'
     : result.kind === 'current' ? '$(history) Codex：没有待同步更新'
@@ -155,10 +156,24 @@ function describeResult(result) {
     : result.kind === 'unavailable' ? '$(history) Codex：尚未连接同步桥'
     : ['dirty_editor', 'debugging', 'editor_not_idle', 'chat_busy', 'codex_busy'].includes(result.reason) ? '$(history) Codex：等待空闲，未同步'
     : '$(history) Codex：等待同步';
+  const selections = result.preview?.conflict_resolution === 'prefer_longer' && Array.isArray(result.preview?.conflict_decisions)
+    ? result.preview.conflict_decisions : [];
+  const selectedText = selections.length && result.kind === 'waiting'
+    ? result.reason === 'longer_wsl_pending' ? '$(history) Codex：已选 WSL 记录，等待桌面端退出'
+      : '$(history) Codex：已选较多记录，等待同步'
+    : text;
+  const choiceCounts = ['windows', 'wsl'].map(side => [side, selections.filter(choice => choice.source === side).length]);
+  const selectionDetail = selections.length ? '\n已按数量选择：' + choiceCounts.filter(([, count]) => count > 0)
+    .map(([side, count]) => `${side === 'windows' ? 'Windows' : 'WSL'} ${count} 条`).join('；') + '。替换前会完整备份旧版本。'
+    + (selections.some(choice => choice.source === 'wsl' && choice.waiting_reason === 'target_backend_running')
+      ? 'WSL 较多的记录需等待桌面端后端停止。' : '') : '';
   const diagnostics = Object.entries(result.preview?.blocked_reason_counts || {})
     .filter(([key, count]) => /^[a-z_]+$/.test(key) && Number.isInteger(count) && count > 0)
     .map(([key, count]) => `${key}：${count}`).join('；');
-  return { text, detail: (reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。') + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
+  const explanation = result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
+    ? '两端聊天数量相同、无法可靠比较，或尚未建立可用基线。已保留两端，未自动选择版本。'
+    : reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
+  return { text: selectedText, detail: explanation + selectionDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
     warning: ['conflict', 'blocked'].includes(result.kind) };
 }
 

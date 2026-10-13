@@ -20,7 +20,7 @@ import tempfile
 import time
 
 VERSION = 1
-SOFTWARE_VERSION = '2.1.0-beta.4'
+SOFTWARE_VERSION = '2.1.0-beta.5'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -54,14 +54,45 @@ def baseline(windows, wsl):
         for tid in sorted(win.keys() | lin.keys())}}
 
 
-def build_plan(windows, wsl, ledger, quiet_seconds=60):
-    """Pure planning: no data changes, no last-modified winner selection."""
+def longer_conflict_selection(win, lin):
+    """Compare indexed, complete histories; never invent counts from a cache."""
+    comparison = {'metric': ['turn_count', 'item_count']}
+    for side, row in (('windows', win), ('wsl', lin)):
+        values = {key: row.get(key) for key in ('turn_count', 'item_count')}
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in values.values()):
+            return None, 'conflict_counts_unavailable', comparison
+        comparison[side] = values
+        size = row.get('transcript_size')
+        if row.get('transcript_complete') is not True or isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            return None, 'conflict_history_incomplete', comparison
+        if values['item_count'] == 0:
+            if row.get('transcript_message_hint') or (row.get('history_mode') == 'legacy' and row.get('has_user_event')):
+                return None, 'conflict_history_unindexed', comparison
+            return None, 'conflict_history_empty', comparison
+        if values['turn_count'] == 0:
+            return None, 'conflict_history_empty', comparison
+    win_count = (comparison['windows']['turn_count'], comparison['windows']['item_count'])
+    lin_count = (comparison['wsl']['turn_count'], comparison['wsl']['item_count'])
+    if win_count == lin_count:
+        return None, 'conflict_counts_equal', comparison
+    source = 'windows' if win_count > lin_count else 'wsl'
+    comparison['selected_source'] = source
+    return source, None, comparison
+
+
+def build_plan(windows, wsl, ledger, quiet_seconds=60, conflict_resolution='manual'):
+    """Pure planning with an explicit opt-in to select the longer conflict."""
+    if conflict_resolution not in ('manual', 'prefer_longer'):
+        raise ValueError('conflict_resolution must be manual or prefer_longer')
     views = {'windows': windows, 'wsl': wsl}
     states = {side: records(view) for side, view in views.items()}
     unavailable = {entry['id'] for view in views.values()
                    for entry in view.get('skipped', []) if entry.get('id')}
-    actions, blocked, pairs = [], [], []
+    actions, blocked, pairs, decisions = [], [], [], []
     for tid in sorted(states['windows'].keys() | states['wsl'].keys()):
+        resolution_info = {}
+        decision = None
         if tid in unavailable:
             blocked.append({'id': tid, 'reason': 'endpoint_record_unavailable'})
             continue
@@ -88,28 +119,56 @@ def build_plan(windows, wsl, ledger, quiet_seconds=60):
                     blocked.append({'id': tid, 'reason': 'initial_body_difference'})
                 continue
             changed = [side for side in states if states[side][tid]['revision'] != old[side]['revision']]
-            if not changed:
+            known_divergence = bool(old.get('body_diverged'))
+            conflict_reason = 'both_sides_changed' if len(changed) == 2 else (
+                'existing_body_difference' if known_divergence else None)
+            if conflict_resolution == 'prefer_longer' and conflict_reason:
+                source, reason, comparison = longer_conflict_selection(win, lin)
+                resolution_info = {'conflict_resolution': 'prefer_longer',
+                                   'conflict_reason': conflict_reason, 'comparison': comparison}
+                if reason:
+                    blocked.append({'id': tid, 'reason': reason, **resolution_info})
+                    continue
+                target = 'wsl' if source == 'windows' else 'windows'
+                resolution_info.update(source=source, target=target)
+                source_counts, target_counts = comparison[source], comparison[target]
+                decision = {'id': tid, 'source': source, 'target': target,
+                            'source_counts': {'turns': source_counts['turn_count'], 'items': source_counts['item_count']},
+                            'target_counts': {'turns': target_counts['turn_count'], 'items': target_counts['item_count']},
+                            'reason': 'more_turns' if source_counts['turn_count'] > target_counts['turn_count'] else 'more_items',
+                            'status': 'waiting'}
+                decisions.append(decision)
+                row = states[source][tid]
+                mode = 'full'
+            elif not changed:
                 continue
-            if len(changed) == 2:
+            elif len(changed) == 2:
                 blocked.append({'id': tid, 'reason': 'both_sides_changed'})
                 continue
-            source = changed[0]
-            target = 'wsl' if source == 'windows' else 'windows'
-            row = states[source][tid]
-            body_changed = row['content_revision'] != old[source]['content_revision']
-            if body_changed and old.get('body_diverged'):
-                blocked.append({'id': tid, 'reason': 'existing_body_difference'})
-                continue
-            mode = 'full' if body_changed else 'metadata'
+            else:
+                source = changed[0]
+                target = 'wsl' if source == 'windows' else 'windows'
+                row = states[source][tid]
+                body_changed = row['content_revision'] != old[source]['content_revision']
+                if body_changed and old.get('body_diverged'):
+                    blocked.append({'id': tid, 'reason': 'existing_body_difference'})
+                    continue
+                mode = 'full' if body_changed else 'metadata'
             if views[target].get('backend_running', True):
-                blocked.append({'id': tid, 'reason': 'target_backend_running'})
+                if decision is not None:
+                    decision['waiting_reason'] = 'target_backend_running'
+                blocked.append({'id': tid, 'reason': 'target_backend_running', **resolution_info})
                 continue
             target_row = states[target][tid]
             if is_busy(target_row, quiet_seconds):
-                blocked.append({'id': tid, 'reason': 'target_busy'})
+                if decision is not None:
+                    decision['waiting_reason'] = 'target_busy'
+                blocked.append({'id': tid, 'reason': 'target_busy', **resolution_info})
                 continue
         if is_busy(row, quiet_seconds):
-            blocked.append({'id': tid, 'reason': 'source_busy'})
+            if decision is not None:
+                decision['waiting_reason'] = 'source_busy'
+            blocked.append({'id': tid, 'reason': 'source_busy', **resolution_info})
             continue
         items, turns = chat_counts(row)
         unindexed = row.get('transcript_message_hint') or (row.get('history_mode') == 'legacy' and row.get('has_user_event') and row.get('transcript_size', 0))
@@ -120,10 +179,16 @@ def build_plan(windows, wsl, ledger, quiet_seconds=60):
             blocked.append({'id': tid, 'reason': 'empty_conversation'})
             continue
         target_row = states[target].get(tid)
+        if decision is not None:
+            decision['status'] = 'ready'
         actions.append({'id': tid, 'source': source, 'target': target, 'mode': mode,
                         'source_revision': row['revision'],
-                        'target_revision': target_row['revision'] if target_row else 'absent'})
-    return {'actions': actions, 'blocked': blocked, 'baseline_pairs': pairs}
+                        'target_revision': target_row['revision'] if target_row else 'absent',
+                        **resolution_info})
+    plan = {'actions': actions, 'blocked': blocked, 'baseline_pairs': pairs}
+    if conflict_resolution == 'prefer_longer':
+        plan['conflict_decisions'] = decisions
+    return plan
 
 
 def decode_output(raw):
@@ -246,7 +311,8 @@ def execute(config, args, runtime, log, progress=None):
     ledger = json.loads(ledger_path.read_text(encoding='utf-8')) if initialized else baseline(windows, wsl)
     if isinstance(ledger.get('version'), bool) or ledger.get('version') != VERSION or not isinstance(ledger.get('threads'), dict):
         raise RuntimeError('Unsupported synchronization ledger version')
-    plan = build_plan(windows, wsl, ledger, config.get('quiet_seconds', 60))
+    plan = build_plan(windows, wsl, ledger, config.get('quiet_seconds', 60),
+                      config.get('conflict_resolution', 'manual'))
     summary = progress if progress is not None else {}
     summary.update({'status': 'dry_run' if args.dry_run else 'completed', 'initialization_required': not initialized,
                'planned_transfers': len(plan['actions']), 'blocked': plan['blocked'], 'transferred': 0,
@@ -255,6 +321,10 @@ def execute(config, args, runtime, log, progress=None):
                'run_limits': limits,
                'inspected_chats': {side: len(rows) for side, rows in states.items()},
                'endpoint_skipped': {'windows': windows.get('skipped', []), 'wsl': wsl.get('skipped', [])}})
+    if 'conflict_decisions' in plan:
+        summary['conflict_decisions'] = plan['conflict_decisions']
+        summary['resolved_conflicts'] = 0
+        summary['conflict_results'] = []
     if args.dry_run:
         summary['actions'] = plan['actions']
         return finish(summary)
@@ -312,6 +382,12 @@ def execute(config, args, runtime, log, progress=None):
             ledger['threads'][action['id']] = {**rows, 'body_diverged': previous.get('body_diverged', False) if action['mode'] == 'metadata' else False}
             atomic_json(ledger_path, ledger)
             summary['transferred'] += 1
+            if action.get('conflict_resolution') == 'prefer_longer':
+                summary['resolved_conflicts'] += 1
+                decision = next(value for value in plan['conflict_decisions'] if value['id'] == action['id'])
+                summary['conflict_results'].append({key: decision[key] for key in (
+                    'id', 'source', 'target', 'source_counts', 'target_counts', 'reason')})
+                summary['conflict_results'][-1]['backup'] = imported.get('backup')
             summary['remaining_transfers'] = summary['planned_transfers'] - summary['transferred']
             journal.unlink()
             log.info('Synchronized %s to %s (%s)', action['id'], action['target'], action['mode'])
@@ -435,6 +511,8 @@ def validate_config(config):
             raise ValueError(f'配置项 {key} 缺失或不是有效字符串')
     if 'python_wsl' in config and (not isinstance(config['python_wsl'], str) or not config['python_wsl'].strip()):
         raise ValueError('配置项 python_wsl 不是有效字符串')
+    if config.get('conflict_resolution', 'manual') not in ('manual', 'prefer_longer'):
+        raise ValueError('配置项 conflict_resolution 须为 manual 或 prefer_longer')
     for key, default in (('max_transfers_per_run', DEFAULT_MAX_TRANSFERS),
                          ('run_budget_seconds', DEFAULT_RUN_BUDGET),
                          ('operation_timeout_seconds', 120), ('quiet_seconds', 60),
@@ -477,6 +555,7 @@ def resolve_runtime(config, config_path, override=None):
 
 def normalize_config(config, config_path, python_override=None, task_override=None):
     value = dict(config)
+    value.setdefault('conflict_resolution', 'manual')
     if python_override:
         value['python_windows'] = str(python_override)
     if task_override:
@@ -598,6 +677,11 @@ REASON_LABELS = {
     'target_backend_running': '目标侧 Codex 正在运行', 'target_backend_started': '目标侧 Codex 在传输前启动',
     'source_busy': '源聊天仍活跃或未静默', 'target_busy': '目标聊天仍活跃或未静默',
     'both_sides_changed': '两端都修改了这条聊天', 'existing_body_difference': '两端正文原本不同',
+    'conflict_counts_unavailable': '冲突聊天没有可靠的轮数和内容条数',
+    'conflict_counts_equal': '两端轮数和内容条数相同，保留冲突',
+    'conflict_history_incomplete': '冲突聊天正文缺失或不完整',
+    'conflict_history_empty': '冲突聊天为空或没有已索引轮次',
+    'conflict_history_unindexed': '冲突聊天正文尚未建立索引',
     'initial_body_difference': '首次发现两端正文不同', 'replica_missing': '曾同步的记录已消失',
     'endpoint_record_unavailable': '无法安全读取某端记录', 'unreadable_transcript': '正文缺失或不完整',
     'empty_conversation': '聊天为空', 'unindexed_history': '旧正文尚未建立索引',

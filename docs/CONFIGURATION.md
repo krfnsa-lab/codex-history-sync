@@ -14,12 +14,17 @@
 | `task_name` | Windows 计划任务名称，默认 `CodexHistorySync-Public` |
 | `interval_minutes` | 检查间隔，默认 5 分钟 |
 | `quiet_seconds` | 聊天至少静默多少秒，默认 60 |
+| `conflict_resolution` | 默认 `manual`，保留冲突；`prefer_longer` 自动选择轮数更多的一端，轮数相同再比较内容条目数 |
 | `max_transfers_per_run` | 每轮最多尝试多少条聊天，默认 10 |
 | `run_budget_seconds` | 本轮软时间预算，默认 120 秒 |
 | `operation_timeout_seconds` | 单次端点调用超时，默认 120 秒 |
 | `task_time_limit_minutes` | 计划任务硬时间上限，默认 10 分钟 |
 
 时间与数量字段都须为正整数；布尔值、浮点数、字符串数字不能替代配置中的整数。
+
+需要自动保留聊天更多的一端时，在个人配置中设置 `"conflict_resolution": "prefer_longer"`。只对已有双方基线的聊天生效，先比较已索引轮数，再比较内容条目数。数值相同、索引缺失或正文不完整时继续保留冲突；不按文件大小或修改时间判断，也不会拼接两份历史。
+
+被替换版本的完整正文、聊天元数据和消息缓存保存在目标数据目录的 `.history-sync-backups/<聊天ID>/<备份目录>`。选择较多的一端可能使较少一端独有的消息退出当前聊天，这些消息保留在备份中。两端须静默，目标 Codex 后端须停止；WSL 较多且桌面端仍打开时，定时任务会等待桌面端后端停止。修改该配置不需要重新初始化基线或重新安装定时任务。
 
 硬上限须满足 `task_time_limit_minutes * 60 >= run_budget_seconds + 3 * operation_timeout_seconds + 60`。这为当前聊天的导出、进程检查、导入和收尾留出余量；更大记录仍可能因单次操作超时而失败，并留下保护日志。配置向导会按所选预算计算默认硬上限。
 

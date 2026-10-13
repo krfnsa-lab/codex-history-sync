@@ -69,27 +69,30 @@ print(json.dumps({'safe':safe}))
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def preview_plan(sync, windows, wsl, ledger, quiet_seconds):
+def preview_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution='manual'):
     # Simulate only the process guard being lifted. All thread, source, baseline,
     # conflict and quiet checks remain the production planner's responsibility.
     relaxed = deepcopy(wsl)
     relaxed['backend_running'] = False
     relaxed['backend_detection_ok'] = True
-    return sync.build_plan(windows, relaxed, ledger, quiet_seconds)
+    if conflict_resolution == 'manual':
+        return sync.build_plan(windows, relaxed, ledger, quiet_seconds)
+    return sync.build_plan(windows, relaxed, ledger, quiet_seconds, conflict_resolution=conflict_resolution)
 
 
-def eligible_candidates(sync, windows, wsl, ledger, quiet_seconds):
-    return [a for a in preview_plan(sync, windows, wsl, ledger, quiet_seconds)['actions']
+def eligible_candidates(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution='manual'):
+    return [a for a in preview_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution)['actions']
             if a['source'] == 'windows' and a['target'] == 'wsl' and a['target_revision'] != 'absent']
 
 
-def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
+def classify_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution='manual'):
     """Report pending incoming updates separately from unrelated historical skips.
 
     Only production-planner actions can become reload candidates. Blocked counts
     contain reason names and totals, never chat titles, bodies or local paths.
     """
-    plan = preview_plan(sync, windows, wsl, ledger, quiet_seconds)
+    plan = preview_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution)
+    decisions = plan.get('conflict_decisions', [])
     candidates = [a for a in plan['actions'] if a['source'] == 'windows' and
                   a['target'] == 'wsl' and a['target_revision'] != 'absent']
     win = {row['id']: row for row in windows.get('threads', [])}
@@ -101,6 +104,7 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
         target_exists = tid in lin or old.get('wsl') is not None
         if target_exists and (previous is None or row['revision'] != previous['revision']):
             relevant.add(tid)
+    relevant.update(item['id'] for item in decisions)
     counts = {}
     ignored = 0
     for item in plan['blocked']:
@@ -114,6 +118,7 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
     # Outgoing updates can themselves be blocked by the Windows backend. They
     # still must not be presented as an absence of pending records.
     outgoing_ids = {a['id'] for a in plan['actions'] if a['source'] == 'wsl'}
+    outgoing_ids.update(item['id'] for item in decisions if item['source'] == 'wsl')
     for tid, row in lin.items():
         old = ledger.get('threads', {}).get(tid, {})
         if old.get('wsl') and old.get('windows') and tid in win and (
@@ -122,7 +127,9 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
             outgoing_ids.add(tid)
     outgoing = len(outgoing_ids)
     conflict_reasons = ('both_sides_changed', 'existing_body_difference',
-                        'initial_body_difference', 'replica_missing')
+                        'initial_body_difference', 'replica_missing', 'conflict_counts_equal',
+                        'conflict_counts_unavailable', 'conflict_history_incomplete',
+                        'conflict_history_empty', 'conflict_history_unindexed')
     conflict_count = sum(counts.get(reason, 0) for reason in conflict_reasons)
     if candidates:
         reason = 'existing_replica_updates'
@@ -130,6 +137,9 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
         reason = 'chat_conflict'
     elif counts.get('source_busy') or counts.get('target_busy'):
         reason = 'chat_busy'
+    elif any(item['source'] == 'wsl' and item.get('waiting_reason') == 'target_backend_running'
+             for item in decisions):
+        reason = 'longer_wsl_pending'
     elif counts:
         reason = 'incoming_update_blocked'
     elif new_count:
@@ -142,7 +152,8 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds):
             'candidate_count': len(candidates), 'reason': reason,
             'blocked_reason_counts': counts, 'conflict_count': conflict_count,
             'ignored_blocked_count': ignored, 'new_chat_count': new_count,
-            'opposite_direction_count': outgoing}
+            'opposite_direction_count': outgoing, 'conflict_resolution': conflict_resolution,
+            'conflict_decisions': decisions}
 
 
 def call_native_probe(sync, config, controller, thread_id, baseline):
@@ -166,7 +177,7 @@ def call_native_probe(sync, config, controller, thread_id, baseline):
     return json.loads(sync.decode_output(result.stdout))
 
 
-def virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet_seconds, verify):
+def virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet_seconds, verify, conflict_resolution='manual'):
     """A verified target-only acknowledgement is virtual until a stopped import.
 
     Genuine cache/message edits, diverged baselines, source activity and failed
@@ -176,7 +187,7 @@ def virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet_seconds, ver
     win = {row['id']: row for row in windows.get('threads', [])}
     lin = {row['id']: row for row in wsl.get('threads', [])}
     proofs = {}
-    blocked = preview_plan(sync, windows, wsl, ledger, quiet_seconds)['blocked']
+    blocked = preview_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution)['blocked']
     for item in blocked:
         if item['reason'] != 'both_sides_changed':
             continue
@@ -201,7 +212,7 @@ def virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet_seconds, ver
         proofs[tid] = proof
     # Even a proof is not sufficient: the ordinary planner must approve the
     # source quietness, available transcript, target quietness and counts.
-    approved = {action['id'] for action in eligible_candidates(sync, windows, wsl, virtual, quiet_seconds)}
+    approved = {action['id'] for action in eligible_candidates(sync, windows, wsl, virtual, quiet_seconds, conflict_resolution)}
     proofs = {tid: proof for tid, proof in proofs.items() if tid in approved}
     for tid in set(virtual['threads']) - set(proofs):
         virtual['threads'][tid] = deepcopy(ledger['threads'][tid])
@@ -227,14 +238,15 @@ def acknowledge_local_settings(sync, endpoint, config, controller, runtime, veri
         raise RuntimeError('The WSL backend must be reliably stopped before synchronization')
     verify = verify or (lambda tid, baseline: call_native_probe(sync, config, controller, tid, baseline))
     quiet = config.get('quiet_seconds', 60)
-    virtual, first = virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet, verify)
+    policy = config.get('conflict_resolution', 'manual')
+    virtual, first = virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet, verify, policy)
     if not first:
         return []
     # Repeat inspection and the native proof against the same original baseline.
     again_windows, again_wsl = endpoint.inspect('windows'), endpoint.inspect('wsl')
     if not stopped_backend(again_wsl):
         raise RuntimeError('The WSL backend restarted during verification')
-    second_virtual, second = virtual_local_settings_ledger(sync, again_windows, again_wsl, ledger, quiet, verify)
+    second_virtual, second = virtual_local_settings_ledger(sync, again_windows, again_wsl, ledger, quiet, verify, policy)
     source_before = {row['id']: row for row in windows.get('threads', [])}
     source_after = {row['id']: row for row in again_windows.get('threads', [])}
     for tid, proof in first.items():
@@ -352,8 +364,8 @@ def probe(controller, config_path):
     if ledger.get('version') != sync.VERSION or not isinstance(ledger.get('threads'), dict):
         raise RuntimeError('Unsupported ledger')
     virtual, proofs = virtual_local_settings_ledger(sync, windows, wsl, ledger, config.get('quiet_seconds', 60),
-        lambda tid, baseline: call_native_probe(sync, config, controller, tid, baseline))
-    summary = classify_plan(sync, windows, wsl, virtual, config.get('quiet_seconds', 60))
+        lambda tid, baseline: call_native_probe(sync, config, controller, tid, baseline), config.get('conflict_resolution', 'manual'))
+    summary = classify_plan(sync, windows, wsl, virtual, config.get('quiet_seconds', 60), config.get('conflict_resolution', 'manual'))
     summary['needs_reconciliation_ids'] = sorted(proofs)
     summary['local_settings_reconciliation_count'] = len(proofs)
     if family is not None:
