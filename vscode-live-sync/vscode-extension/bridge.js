@@ -130,6 +130,8 @@ function describeResult(result) {
     other_window: '同步桥属于另一个 VS Code 窗口，此次未同步。请在该窗口触发检查。',
     codex_busy: 'Codex 正在处理请求或尚未空闲 60 秒，此次未同步。',
     existing_pause: '已有暂停保护，此次未同步。请先检查上一轮同步是否需要恢复。',
+    recovery_pending: '恢复检查尚未通过，自动同步仍暂停；空闲后会自动重试，也可再次点击检查。',
+    gateway_unhealthy: '同步桥尚未恢复正常运行，自动同步仍暂停。请检查 Codex 连接状态。',
     instances_changed: 'Codex 窗口发生变化，此次未同步，稍后会重试。',
     controller_running: '定时同步正在执行，此次未重复传输。',
     zero_transfers: '同步器本轮没有传输记录，已恢复 Codex，稍后会重新检查。',
@@ -191,10 +193,52 @@ class Coordinator {
     this.nextAttemptAt = dependencies.nextAttemptAt || (() => 0);
   }
 
+  async recover() {
+    if (this.running) return { kind: 'waiting', reason: 'check_running' };
+    this.running = true;
+    const pauseFile = path.join(this.config.stateDir, 'pause.json');
+    let recoveryChildPid;
+    const hasPause = async () => {
+      try { await fs.lstat(pauseFile); return true; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    };
+    const health = async instance => {
+      const reply = await this.request(instance, 'status');
+      const state = reply?.state;
+      if (!reply?.ok || !state || state.child_running !== true || state.paused !== false ||
+          state.shutdown_failed !== false || state.starting !== false ||
+          !Number.isInteger(state.child_pid) || state.child_pid <= 0) return 'gateway_unhealthy';
+      if (state.busy !== false || ['pending_request_count', 'server_request_count', 'active_turn_count', 'known_activity_count'].some(key => state[key] !== 0) ||
+          !Number.isFinite(state.idle_seconds) || state.idle_seconds < 60) return 'codex_busy';
+      if (recoveryChildPid !== undefined && recoveryChildPid !== state.child_pid) return 'instances_changed';
+      recoveryChildPid = state.child_pid;
+      return null;
+    };
+    try {
+      await secureDirectory(this.config.stateDir);
+      if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
+      const instances = await this.discover(this.config.stateDir);
+      if (instances.length === 0) return { kind: 'unavailable', reason: 'gateway_unavailable' };
+      if (instances.length !== 1) return { kind: 'waiting', reason: 'multiple_windows' };
+      if (instances[0].parent_pid !== process.pid) return { kind: 'waiting', reason: 'other_window' };
+      const first = await health(instances[0]);
+      if (first) return { kind: 'waiting', reason: first };
+      if ((await this.runWindows(this.config, 'recovery'))?.safe_to_reload !== true) {
+        return { kind: 'blocked', reason: 'recovery_pending' };
+      }
+      if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
+      if (!sameInstances(instances, await this.discover(this.config.stateDir))) return { kind: 'waiting', reason: 'instances_changed' };
+      const final = await health(instances[0]);
+      if (final) return { kind: 'waiting', reason: final };
+      if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
+      return { kind: 'recovered', reason: 'recovery_verified' };
+    } finally { this.running = false; }
+  }
+
   async check() {
     if (this.running) return { kind: 'waiting', reason: 'check_running' };
     this.running = true;
-    let lease = null; let pauseStarted = false; let operationFailed = false;
+    let lease = null; let pauseStarted = false; let operationFailed = false; let operationError;
     const pauseFile = path.join(this.config.stateDir, 'pause.json');
     try {
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason() };
@@ -250,6 +294,7 @@ class Coordinator {
       return { kind: 'synced', result, preview };
     } catch (error) {
       operationFailed = true;
+      operationError = error;
       throw error;
     } finally {
       // Never remove the synchronizer's pending marker. It belongs to its own recovery protocol.
@@ -259,18 +304,18 @@ class Coordinator {
           try { recovery = await this.runWindows(this.config, 'recovery'); }
           catch { recovery = { safe_to_reload: false }; }
           const safe = recovery?.safe_to_reload === true;
-          if (operationFailed || !safe) await this.onFailure();
+          if (operationFailed || !safe) await this.onFailure(operationError || new Error('无法确认同步恢复状态，暂停保护已保留。'));
           if (!safe) throw new Error('同步需要检查：已保留暂停保护。请确认没有未完成导入后再恢复 Codex。');
           if (!this.canReload()) {
-            if (!operationFailed) await this.onFailure();
+            if (!operationFailed) await this.onFailure(new Error('编辑器有未保存内容或正在调试，已保留暂停保护。'));
             throw new Error('编辑器有未保存内容或正在调试，已保留暂停保护。请保存并完成恢复检查后重载。');
           }
           try { if (lease) await this.removeLease(pauseFile, lease); }
-          catch (error) { if (!operationFailed) await this.onFailure(); throw error; }
+          catch (error) { if (!operationFailed) await this.onFailure(error); throw error; }
           lease = null;
           // Verify that no controller/importer or unfinished journal exists before permitting a fresh backend.
           try { await this.reload(); }
-          catch (error) { if (!operationFailed) await this.onFailure(); throw error; }
+          catch (error) { if (!operationFailed) await this.onFailure(error); throw error; }
         } else if (lease) {
           await this.removeLease(pauseFile, lease);
         }

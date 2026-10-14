@@ -45,7 +45,9 @@ WSL 插件打开聊天时可能追加本地设置记录。默认策略下，同�
 
 正常关闭：运行 **Codex History: Disable and Restore Original Codex**，然后重载窗口。
 
-如果同步失败，扩展会停用自动同步并保留必要的暂停保护。不要删除同步器的 `runtime/pending.json` 或聊天备份。先检查、完成或回滚未完成导入。确认完成后，关闭 WSL VS Code 窗口并运行：
+如果同步失败，扩展会暂停自动同步并保留必要的保护。0.1.5 起，点击状态文字或启用命令仍能执行恢复检查；启动时和定期检查也会重试。只有当前窗口唯一后端健康空闲、没有暂停文件、Windows 同步器没有运行或未完成导入时，才通过 VS Code API 恢复自动同步。恢复检查本身不传输聊天，不终止后端或重载窗口；手动停用会阻止自动恢复。
+
+从旧版“同步需要检查”状态升级后，保存文件并重载一次窗口，加载新恢复入口；以后不需要重复安装或重新初始化。若仍有未完成导入或暂停保护，不要删除 `runtime/pending.json` 或聊天备份，先检查、完成或回滚。确认完成后，关闭 WSL VS Code 窗口并运行：
 
 ```powershell
 .\recover.ps1 -Config 'C:\your-folder\codex-history-sync\config.json'

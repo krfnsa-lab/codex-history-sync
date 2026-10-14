@@ -7,6 +7,8 @@ const { Coordinator, validateConfig, readPrivateJson, runWindows, describeResult
 let timer; let coordinator; let status; let lastError = '';
 let extensionContext;
 let setupInProgress = false;
+let recoveryInProgress = false;
+let disableGeneration = 0;
 const section = 'codexHistoryLiveSync';
 const gatewayName = 'codex-history-sync-bridge';
 
@@ -77,6 +79,7 @@ async function setup(context) {
     await context.globalState.update('setupInstalledSettings', proposed);
     if (!await configureGateway(context, true)) return;
     await context.globalState.update('nextAttemptAt', 0);
+    await context.globalState.update('reviewRecoverySuppressed', false);
     await config.update('enabled', true, vscode.ConfigurationTarget.Global);
     reloadRequested = true;
     await vscode.commands.executeCommand('workbench.action.reloadWindow');
@@ -86,7 +89,7 @@ async function setup(context) {
 
 async function disableRestore(context) {
   const wasRunning = coordinator?.running;
-  await vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global);
+  await disable();
   const currentSettings = settings();
   if (wasRunning || (isWsl() && currentSettings.stateDir && fs.existsSync(path.join(currentSettings.stateDir, 'pause.json')))) {
     await vscode.window.showWarningMessage('自动同步已停用。仍有同步或暂停保护，请先通过恢复工具检查；当前不会恢复原 Codex 启动设置。'); return;
@@ -134,9 +137,71 @@ function canReload() {
   return !vscode.debug.activeDebugSession && !vscode.workspace.textDocuments.some(document => document.isDirty);
 }
 
+function failureMessage(error) {
+  const message = String(error?.message || '');
+  if (/未保存|Unsaved work/.test(message)) return '编辑器有未保存内容或正在调试，已保留暂停保护。';
+  if (/暂停保护|恢复状态|pause lease/.test(message)) return '无法确认同步恢复状态，暂停保护已保留。';
+  if (/无法读取 Windows 同步脚本/.test(message)) return '无法读取 Windows 同步脚本，请重新安装同步桥以修复路径。';
+  if (/找不到 Windows Python/.test(message)) return '找不到 Windows Python，请检查同步桥的解释器配置。';
+  if (/同步检查超时/.test(message)) return '同步检查超时，已保留原记录；请稍后重试。';
+  return '同步未完成，需要恢复检查。';
+}
+
+async function disable() {
+  disableGeneration += 1;
+  await extensionContext.globalState.update('reviewRecoverySuppressed', true);
+  await vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global);
+}
+
 async function check(manual = false) {
-  if (!coordinator) return;
+  if (!coordinator) {
+    if (manual) await vscode.window.showWarningMessage('同步尚未启用或配置不完整，请先检查同步桥设置。');
+    return;
+  }
   try {
+    if (extensionContext.globalState.get('needsReview')) {
+      if (!manual && extensionContext.globalState.get('reviewRecoverySuppressed')) return;
+      if (recoveryInProgress) {
+        if (manual) await vscode.window.showInformationMessage('恢复检查正在进行，请等待本轮结束。');
+        return;
+      }
+      recoveryInProgress = true;
+      const generation = disableGeneration;
+      try {
+        const recovered = await coordinator.recover();
+        if (recovered.kind === 'recovered') {
+          if (generation !== disableGeneration) return;
+          await extensionContext.globalState.update('reviewError', undefined);
+          await extensionContext.globalState.update('nextAttemptAt', 0);
+          if (generation !== disableGeneration) return;
+          await vscode.workspace.getConfiguration(section).update('enabled', true, vscode.ConfigurationTarget.Global);
+          if (generation !== disableGeneration) {
+            await vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global);
+            return;
+          }
+          await extensionContext.globalState.update('reviewRecoverySuppressed', false);
+          await extensionContext.globalState.update('needsReview', false);
+          if (generation !== disableGeneration) {
+            await extensionContext.globalState.update('reviewRecoverySuppressed', true);
+            await extensionContext.globalState.update('needsReview', true);
+            await vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global);
+            return;
+          }
+          status.text = '$(history) Codex：已恢复自动同步';
+          status.tooltip = '恢复检查已通过，后续检查会继续同步；本次恢复检查未传输记录。';
+          if (manual) await vscode.window.showInformationMessage(status.tooltip);
+          return;
+        }
+        const presentation = describeResult(recovered);
+        status.text = '$(warning) Codex：同步需要检查';
+        status.tooltip = '自动同步仍暂停。' + presentation.detail;
+        if (manual) await vscode.window.showWarningMessage(status.tooltip);
+        return;
+      } finally {
+        recoveryInProgress = false;
+        configure(false);
+      }
+    }
     const result = await coordinator.check();
     const presentation = describeResult(result);
     status.text = presentation.text;
@@ -146,20 +211,23 @@ async function check(manual = false) {
       else await vscode.window.showInformationMessage(presentation.detail);
     }
   } catch (error) {
+    const message = failureMessage(error);
     status.text = '$(warning) Codex：同步待处理';
-    status.tooltip = error.message;
-    if (manual && lastError !== error.message) await vscode.window.showWarningMessage(error.message);
-    lastError = error.message;
+    status.tooltip = message;
+    if (manual && lastError !== message) await vscode.window.showWarningMessage(message);
+    lastError = message;
   }
 }
 
-function configure() {
+function configure(initialCheck = true) {
+  if (recoveryInProgress) return;
   if (timer) clearInterval(timer); timer = null; coordinator = null;
   const config = settings();
   if (setupInProgress) return;
   process.env.CODEX_HISTORY_SYNC_STATE_DIR = config.stateDir || '';
-  if (extensionContext.globalState.get('needsReview')) { status.show(); status.text = '$(warning) Codex：同步需要检查'; return; }
-  if (!config.enabled) { status.hide(); return; }
+  const needsReview = extensionContext.globalState.get('needsReview');
+  const recoverySuppressed = extensionContext.globalState.get('reviewRecoverySuppressed');
+  if (!config.enabled && !needsReview) { status.hide(); return; }
   status.show();
   if (!isWsl()) { status.text = '$(history) Codex：请在 WSL 中启用'; return; }
   try {
@@ -170,16 +238,20 @@ function configure() {
       nextAttemptAt: () => extensionContext.globalState.get('nextAttemptAt', 0),
       onDeferred: value => extensionContext.globalState.update('nextAttemptAt', value),
       reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
-      onFailure: async () => {
+      onFailure: async error => {
+        await extensionContext.globalState.update('reviewError', failureMessage(error));
         await extensionContext.globalState.update('needsReview', true);
         await vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global);
       }
     });
   } catch (error) { status.text = '$(warning) Codex：需要配置'; status.tooltip = error.message; return; }
-  status.text = '$(history) Codex：自动同步已启用';
-  timer = setInterval(() => void check(), Math.max(30, config.intervalSeconds || 60) * 1000);
-  timer.unref?.();
-  void check();
+  status.text = needsReview ? '$(warning) Codex：同步需要检查' : '$(history) Codex：自动同步已启用';
+  status.tooltip = needsReview ? recoverySuppressed ? '自动同步已手动停用；点击检查可验证是否能够恢复。' : (extensionContext.globalState.get('reviewError') || '自动同步暂停，正在等待安全恢复检查。') : '';
+  if (!needsReview || !recoverySuppressed) {
+    timer = setInterval(() => void check(), Math.max(30, config.intervalSeconds || 60) * 1000);
+    timer.unref?.();
+    if (initialCheck) void check();
+  }
 }
 
 function activate(context) {
@@ -195,11 +267,12 @@ function activate(context) {
       if (!isWsl()) { await vscode.window.showWarningMessage('请在连接 WSL 的 VS Code 窗口中启用。'); return; }
       try { validateConfig(settings()); }
       catch (error) { await vscode.window.showWarningMessage(error.message); return; }
-      if (context.globalState.get('needsReview')) { await vscode.window.showWarningMessage('请先检查未完成的同步，再停用并恢复原设置。'); return; }
+      if (context.globalState.get('needsReview')) { await check(true); return; }
       if (vscode.workspace.getConfiguration('chatgpt').get('cliExecutable') !== gatewayName) { await vscode.window.showWarningMessage('请先配置同步桥，再启用自动同步。'); return; }
+      await context.globalState.update('reviewRecoverySuppressed', false);
       await vscode.workspace.getConfiguration(section).update('enabled', true, vscode.ConfigurationTarget.Global);
     }),
-    vscode.commands.registerCommand('codexHistoryLiveSync.disable', () => vscode.workspace.getConfiguration(section).update('enabled', false, vscode.ConfigurationTarget.Global)),
+    vscode.commands.registerCommand('codexHistoryLiveSync.disable', disable),
     vscode.commands.registerCommand('codexHistoryLiveSync.checkNow', () => check(true)),
     vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration(section)) configure(); }),
     { dispose: () => { if (timer) clearInterval(timer); } }

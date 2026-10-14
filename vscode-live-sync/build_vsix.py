@@ -43,5 +43,5 @@ def package(output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'dist/codex-history-live-sync-0.1.4.vsix')
+    parser.add_argument('--output', type=Path, default=ROOT / 'dist/codex-history-live-sync-0.1.5.vsix')
     print(package(parser.parse_args().output))

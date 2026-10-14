@@ -72,6 +72,84 @@ async function fixture(t, changes = {}) {
   return { config, instances, calls, coordinator: new Coordinator(config, dependencies) };
 }
 
+const healthyRecoveryState = { busy: false, paused: false, child_running: true, child_pid: 202,
+  starting: false, shutdown_failed: false, idle_seconds: 60, pending_request_count: 0,
+  server_request_count: 0, active_turn_count: 0, known_activity_count: 0 };
+
+test('review recovery proves health twice and never pauses, imports or reloads', async t => {
+  const f = await fixture(t);
+  f.coordinator.request = async (_, action) => { f.calls.push(action); return { ok: true, state: healthyRecoveryState }; };
+  assert.deepEqual(await f.coordinator.recover(), { kind: 'recovered', reason: 'recovery_verified' });
+  assert.deepEqual(f.calls, ['status', 'recovery', 'status']);
+  assert.equal(f.coordinator.running, false);
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+});
+
+test('review recovery preserves an existing pause, even a symlink', async t => {
+  const f = await fixture(t);
+  const pause = path.join(f.config.stateDir, 'pause.json');
+  await fs.symlink(path.join(f.config.stateDir, 'missing'), pause);
+  assert.equal((await f.coordinator.recover()).reason, 'existing_pause');
+  assert.deepEqual(f.calls, []);
+  assert.equal((await fs.lstat(pause)).isSymbolicLink(), true);
+});
+
+test('review recovery keeps busy, unhealthy and incomplete gateway states disabled', async t => {
+  for (const changes of [{ busy: true }, { idle_seconds: 59 }, { child_running: false }, { paused: true },
+    { shutdown_failed: true }, { starting: true }, { pending_request_count: 1 }, { active_turn_count: 1 },
+    { child_pid: undefined }, { shutdown_failed: undefined }, { known_activity_count: undefined }]) {
+    const f = await fixture(t, { request: async () => ({ ok: true, state: { ...healthyRecoveryState, ...changes } }) });
+    assert.notEqual((await f.coordinator.recover()).kind, 'recovered');
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('review recovery refuses another window and multiple instances', async t => {
+  const f = await fixture(t);
+  f.instances[0].parent_pid = process.pid + 1;
+  assert.equal((await f.coordinator.recover()).reason, 'other_window');
+  f.instances.push({ instance_id: 'two' });
+  assert.equal((await f.coordinator.recover()).reason, 'multiple_windows');
+  assert.deepEqual(f.calls, []);
+});
+
+test('review recovery requires a safe Windows proof and unchanged instance and lease state', async t => {
+  for (const mutation of ['pending', 'new_instance', 'pause', 'busy', 'child_changed']) {
+    const f = await fixture(t);
+    let busy = false;
+    let child_pid = healthyRecoveryState.child_pid;
+    f.coordinator.discover = async () => f.instances.map(instance => ({ ...instance }));
+    f.coordinator.request = async () => ({ ok: true, state: { ...healthyRecoveryState, busy, child_pid } });
+    f.coordinator.runWindows = async (_, mode) => {
+      assert.equal(mode, 'recovery');
+      if (mutation === 'new_instance') f.instances[0] = { ...f.instances[0], nonce: 'changed-nonce' };
+      if (mutation === 'pause') await fs.writeFile(path.join(f.config.stateDir, 'pause.json'), 'protected', { mode: 0o600 });
+      if (mutation === 'busy') busy = true;
+      if (mutation === 'child_changed') child_pid += 1;
+      return { safe_to_reload: mutation !== 'pending' };
+    };
+    assert.notEqual((await f.coordinator.recover()).kind, 'recovered');
+    assert.equal(f.coordinator.running, false);
+  }
+});
+
+test('review recovery rejects a public state directory before contacting anything', async t => {
+  const f = await fixture(t);
+  await fs.chmod(f.config.stateDir, 0o755);
+  await assert.rejects(f.coordinator.recover(), /private/);
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.coordinator.running, false);
+});
+
+test('review recovery exceptions release only the local check flag', async t => {
+  const f = await fixture(t, { request: async () => { throw new Error('unavailable'); } });
+  await assert.rejects(f.coordinator.recover(), /unavailable/);
+  assert.equal(f.coordinator.running, false);
+  f.coordinator.running = true;
+  assert.equal((await f.coordinator.recover()).reason, 'check_running');
+  assert.deepEqual(f.calls, []);
+});
+
 test('reject malformed paths before any process starts', () => {
   assert.throws(() => validateConfig({ stateDir: '../relative' }));
   assert.throws(() => validateConfig({ stateDir: '/tmp/state', windowsPython: '/mnt/c/python.exe', windowsController: 'relative.py' }));
