@@ -9,8 +9,15 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 import uuid
+
+# Source entry points live one directory below shared modules; deployed helpers
+# keep the same module beside this file. Support both without PYTHONPATH setup.
+if (Path(__file__).resolve().parent.parent / 'history_progress.py').is_file():
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from history_progress import ProgressWriter
 
 
 def load_controller(controller, config_path):
@@ -306,7 +313,7 @@ def acknowledge_local_settings(sync, endpoint, config, controller, runtime, veri
     return selected
 
 
-def sync_once(controller, config_path):
+def sync_once(controller, config_path, request_id=None):
     if os.name != 'nt':
         raise RuntimeError('Run this helper with native Windows Python')
     controller, sync, config, runtime = load_controller(controller, config_path)
@@ -317,12 +324,24 @@ def sync_once(controller, config_path):
     with sync.run_lock(runtime / 'run.lock') as acquired:
         if not acquired:
             return {'status': 'skipped_already_running', 'transferred': 0}
-        endpoint = sync.Endpoints(config, controller.parent)
-        acknowledged = acknowledge_local_settings(sync, endpoint, config, controller, runtime)
-        args = SimpleNamespace(initialize=False, dry_run=False)
-        result = sync.execute(config, args, runtime, logging.getLogger('codex-history-sync'))
-        result['local_settings_acknowledged'] = len(acknowledged)
-        sync.save_run_report(runtime, result)
+        writer = ProgressWriter(runtime / 'progress.json', kind='sync', request_id=request_id)
+        writer.update('checking_windows')
+        try:
+            endpoint = sync.Endpoints(config, controller.parent)
+            endpoint.reporter = writer
+            acknowledged = acknowledge_local_settings(sync, endpoint, config, controller, runtime)
+            args = SimpleNamespace(initialize=False, dry_run=False, progress_writer=writer,
+                                   progress_request_id=request_id)
+            result = sync.execute(config, args, runtime, logging.getLogger('codex-history-sync'))
+            result['local_settings_acknowledged'] = len(acknowledged)
+            sync.save_run_report(runtime, result)
+        except BaseException:
+            writer.finish('error', reason='task_failed')
+            raise
+        writer.finish('completed' if result.get('transferred', 0) else 'waiting',
+                      transferred_chats=result.get('transferred', 0),
+                      total_chats=result.get('planned_transfers', 0),
+                      reason='deferred' if not result.get('transferred', 0) else None)
         return result
 
 
@@ -347,7 +366,13 @@ def accepted_backend_family(wsl, family):
             and family.get('helper_count') == wsl.get('backend_count') - 1)
 
 
-def probe(controller, config_path):
+def progress_path(controller, config_path):
+    """Resolve diagnostics paths without inspecting databases or starting WSL."""
+    _, sync, _, runtime = load_controller(controller, config_path)
+    return {'ok': True, 'progress_file': sync.linux_mount_path(runtime / 'progress.json')}
+
+
+def probe(controller, config_path, request_id=None):
     if os.name != 'nt':
         raise RuntimeError('Run this probe with native Windows Python')
     controller, sync, config, runtime = load_controller(controller, config_path)
@@ -357,25 +382,34 @@ def probe(controller, config_path):
         return {'eligible': False, 'candidate_ids': [], 'reason': 'baseline_missing'}
     if (runtime / 'pending.json').exists():
         return {'eligible': False, 'candidate_ids': [], 'reason': 'pending_import'}
-    # Do not propose pausing the backend while an ordinary task or merge owns
-    # the controller. The actual import still reacquires this lock afterward.
-    lock = runtime / 'run.lock'
-    if not lock.is_file():
+    if not (runtime / 'run.lock').is_file():
         return {'eligible': False, 'candidate_ids': [], 'reason': 'lock_missing'}
-    import msvcrt
-    with lock.open('r+b') as stream:
-        try:
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+    # The diagnostic snapshot has one writer. Retain the ordinary controller
+    # lock through this read-only scan; never overwrite another task's progress.
+    with sync.run_lock(runtime / 'run.lock') as acquired:
+        if not acquired:
             return {'eligible': False, 'candidate_ids': [], 'reason': 'controller_running'}
+        if (runtime / 'pending.json').exists():
+            return {'eligible': False, 'candidate_ids': [], 'reason': 'pending_import'}
+        writer = ProgressWriter(runtime / 'progress.json', kind='check', request_id=request_id)
+        writer.update('starting')
         try:
-            if (runtime / 'pending.json').exists():
-                return {'eligible': False, 'candidate_ids': [], 'reason': 'pending_import'}
-        finally:
-            stream.seek(0)
-            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            result = _probe_locked(controller, sync, config, runtime, writer)
+        except BaseException:
+            writer.finish('error', reason='task_failed')
+            raise
+        writer.finish('completed' if result.get('reason') == 'no_pending_updates' else 'waiting',
+                      reason='updates_available' if result.get('eligible') else result.get('reason'))
+        return result
+
+
+def _probe_locked(controller, sync, config, runtime, writer):
     endpoint = sync.Endpoints(config, controller.parent)
-    windows, wsl = endpoint.inspect('windows'), endpoint.inspect('wsl')
+    endpoint.reporter = writer
+    writer.update('checking_windows')
+    windows = endpoint.inspect('windows')
+    writer.update('checking_wsl')
+    wsl = endpoint.inspect('wsl')
     if not wsl.get('backend_detection_ok'):
         return {'eligible': False, 'candidate_ids': [], 'reason': 'backend_detection_failed'}
     # A running ordinary task can import directly without a VS Code reload.
@@ -387,6 +421,7 @@ def probe(controller, config_path):
         if not accepted_backend_family(wsl, family):
             return {'eligible': False, 'candidate_ids': [], 'reason': 'other_native_backends',
                     'backend_count': wsl.get('backend_count'), 'process_reason': family.get('reason')}
+    writer.update('planning')
     ledger = json.loads((runtime / 'ledger.json').read_text(encoding='utf-8'))
     if ledger.get('version') != sync.VERSION or not isinstance(ledger.get('threads'), dict):
         raise RuntimeError('Unsupported ledger')
@@ -410,13 +445,17 @@ def main():
     parser.add_argument('--controller', required=True)
     parser.add_argument('--config', required=True)
     parser.add_argument('--json', action='store_true')
+    parser.add_argument('--progress-request-id', type=lambda value: str(uuid.UUID(value)))
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--recovery-state', action='store_true')
     mode.add_argument('--sync-once', action='store_true')
+    mode.add_argument('--progress-path', action='store_true')
     args = parser.parse_args()
     try:
-        value = (recovery_state(args.controller, args.config) if args.recovery_state else
-                 sync_once(args.controller, args.config) if args.sync_once else probe(args.controller, args.config))
+        value = (progress_path(args.controller, args.config) if args.progress_path else
+                 recovery_state(args.controller, args.config) if args.recovery_state else
+                 sync_once(args.controller, args.config, args.progress_request_id) if args.sync_once else
+                 probe(args.controller, args.config, args.progress_request_id))
         code = 0
     except Exception as error:
         # Paths and endpoint errors are local diagnostics; never include messages.

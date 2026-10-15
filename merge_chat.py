@@ -14,6 +14,7 @@ import time
 import uuid
 
 from history_merge import merge_packages
+from history_progress import ProgressWriter
 
 
 def load(controller, config_path):
@@ -147,92 +148,109 @@ def execute(sync, config, runtime, endpoint, args):
     with sync.run_lock(runtime / 'run.lock') as acquired:
         if not acquired:
             return {'ok': True, 'status': 'waiting', 'reason': 'controller_running'}
-        ledger = json.loads((runtime / 'ledger.json').read_text(encoding='utf-8'))
-        if type(ledger.get('version')) is not int or ledger.get('version') != sync.VERSION or not isinstance(ledger.get('threads'), dict):
-            raise RuntimeError('Initialize a compatible baseline before merging')
-        jobs = runtime / 'merges'
-        if args.resume:
-            job_id = str(uuid.UUID(args.resume))
-            job = jobs / job_id
-            if job.is_symlink() or not job.resolve().is_relative_to(jobs.resolve()):
-                raise RuntimeError('Unexpected recovery path')
-            prepared = json.loads((job / 'job.json').read_text(encoding='utf-8'))
-            if prepared['job_id'] != job_id:
-                raise RuntimeError('Recovery job identity changed')
-            if prepared['status'] == 'completed':
-                return {'ok': True, 'status': 'already_merged', 'id': prepared['new_id'], 'title': prepared['title']}
-            return finish_job(sync, endpoint, runtime, ledger, job, prepared)
-        if (runtime / 'pending.json').exists():
-            marker = json.loads((runtime / 'pending.json').read_text(encoding='utf-8'))
-            return {'ok': True, 'status': 'waiting', 'reason': 'pending_import', 'resume_job_id': marker.get('job_id') if marker.get('kind') == 'merge_copy' else None}
-        views = {s: endpoint.inspect(s) for s in ('windows', 'wsl')}
-        choices = candidates(sync, views, ledger, config.get('quiet_seconds', 60))
-        if args.list:
-            return {'ok': True, 'status': 'candidates', 'chats': choices}
-        selected = next((c for c in choices if c['id'] == args.id), None)
-        if not selected or not selected['ready']:
-            return {'ok': True, 'status': 'waiting', 'reason': 'chat_busy_or_not_conflicting'}
-        if getattr(args, 'keep_side', None):
-            if getattr(args, 'expected_token', None) != selected['choice_token']:
-                return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
-            jid = str(uuid.uuid4())
-            job = runtime / 'conflict-choices' / jid
-            job.mkdir(parents=True, mode=0o700)
-            sources, hashes = {}, {}
-            for side in ('windows', 'wsl'):
-                record = sync.records(views[side])[args.id]
-                destination = job / side
-                native = str(destination) if side == 'windows' else sync.linux_mount_path(destination)
-                try:
-                    endpoint.call(side, 'export', '--id', args.id, '--package', native, '--expected', record['revision'])
-                except sync.EndpointCallError as error:
-                    if error.side == side and error.operation == 'export' and error.code in ('source_changed', 'source_active', 'thread_missing'):
-                        return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
-                    raise
-                sources[side] = record
-                hashes[side] = {name: sha(destination / name) for name in ('meta.json', 'history.sqlite', 'transcript.jsonl')}
-            for side in ('windows', 'wsl'):
-                current = sync.records(endpoint.inspect(side)).get(args.id)
-                if not current or current['revision'] != sources[side]['revision'] or sync.is_busy(current, config.get('quiet_seconds', 60)):
-                    return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
-            choice = {'choice_id': jid, 'id': args.id, 'keep_side': args.keep_side, 'status': 'pending',
-                      'expected': {side: record['revision'] for side, record in sources.items()},
-                      'package_hashes': hashes, 'created_at': sync.utc_now()}
-            for side in ('windows', 'wsl'):
-                sync.conflict_choice_package(runtime, choice, side)
-            sync.atomic_json(job / 'ledger-before.json', ledger)
-            sync.atomic_json(job / 'choice.json', choice)
-            store = sync.read_conflict_choices(runtime)
-            store['choices'][args.id] = choice
-            sync.atomic_json(runtime / 'conflict-choices.json', store)
-            return {'ok': True, 'status': 'choice_saved', 'reason': 'waiting_for_safe_sync',
-                    'choice_id': jid, 'id': args.id, 'keep_side': args.keep_side}
+        writer = ProgressWriter(runtime / 'progress.json', kind='check' if args.list else 'choice',
+                                request_id=getattr(args, 'progress_request_id', None))
+        writer.update('starting')
+        endpoint.reporter = writer
+        try:
+            result = _execute_locked(sync, config, runtime, endpoint, args)
+        except BaseException:
+            writer.finish('error', reason='task_failed')
+            raise
+        writer.finish('completed' if result.get('status') in ('candidates', 'merged', 'already_merged') else 'waiting',
+                      processed_chats=1 if result.get('status') == 'choice_saved' else 0,
+                      total_chats=1 if getattr(args, 'keep_side', None) else 0,
+                      reason=result.get('reason'))
+        return result
+
+
+def _execute_locked(sync, config, runtime, endpoint, args):
+    ledger = json.loads((runtime / 'ledger.json').read_text(encoding='utf-8'))
+    if type(ledger.get('version')) is not int or ledger.get('version') != sync.VERSION or not isinstance(ledger.get('threads'), dict):
+        raise RuntimeError('Initialize a compatible baseline before merging')
+    jobs = runtime / 'merges'
+    if args.resume:
+        job_id = str(uuid.UUID(args.resume))
+        job = jobs / job_id
+        if job.is_symlink() or not job.resolve().is_relative_to(jobs.resolve()):
+            raise RuntimeError('Unexpected recovery path')
+        prepared = json.loads((job / 'job.json').read_text(encoding='utf-8'))
+        if prepared['job_id'] != job_id:
+            raise RuntimeError('Recovery job identity changed')
+        if prepared['status'] == 'completed':
+            return {'ok': True, 'status': 'already_merged', 'id': prepared['new_id'], 'title': prepared['title']}
+        return finish_job(sync, endpoint, runtime, ledger, job, prepared)
+    if (runtime / 'pending.json').exists():
+        marker = json.loads((runtime / 'pending.json').read_text(encoding='utf-8'))
+        return {'ok': True, 'status': 'waiting', 'reason': 'pending_import', 'resume_job_id': marker.get('job_id') if marker.get('kind') == 'merge_copy' else None}
+    views = {s: endpoint.inspect(s) for s in ('windows', 'wsl')}
+    choices = candidates(sync, views, ledger, config.get('quiet_seconds', 60))
+    if args.list:
+        return {'ok': True, 'status': 'candidates', 'chats': choices}
+    selected = next((c for c in choices if c['id'] == args.id), None)
+    if not selected or not selected['ready']:
+        return {'ok': True, 'status': 'waiting', 'reason': 'chat_busy_or_not_conflicting'}
+    if getattr(args, 'keep_side', None):
+        if getattr(args, 'expected_token', None) != selected['choice_token']:
+            return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
         jid = str(uuid.uuid4())
-        job = jobs / jid
+        job = runtime / 'conflict-choices' / jid
         job.mkdir(parents=True, mode=0o700)
-        sources = {}
+        sources, hashes = {}, {}
         for side in ('windows', 'wsl'):
             record = sync.records(views[side])[args.id]
             destination = job / side
             native = str(destination) if side == 'windows' else sync.linux_mount_path(destination)
-            endpoint.call(side, 'export', '--id', args.id, '--package', native, '--expected', record['revision'])
+            try:
+                endpoint.call(side, 'export', '--id', args.id, '--package', native, '--expected', record['revision'])
+            except sync.EndpointCallError as error:
+                if error.side == side and error.operation == 'export' and error.code in ('source_changed', 'source_active', 'thread_missing'):
+                    return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
+                raise
             sources[side] = record
-        title = selected['label'][:60] + '（Win与WSL合并副本）'
-        report = merge_packages(job / 'windows', job / 'wsl', job / 'copy', title)
-        validate_native(sync, config, job, job / 'copy' / 'merged')
+            hashes[side] = {name: sha(destination / name) for name in ('meta.json', 'history.sqlite', 'transcript.jsonl')}
         for side in ('windows', 'wsl'):
-            rows = sync.records(endpoint.inspect(side))
-            current = rows.get(args.id)
-            if not current or current['revision'] != sources[side]['revision'] or current.get('active'):
-                return {'ok': True, 'status': 'waiting', 'reason': 'source_changed', 'job_id': jid}
-            target = str(job / 'copy' / 'merged') if side == 'windows' else sync.linux_mount_path(job / 'copy' / 'merged')
-            if endpoint.call(side, 'import-preview', '--package', target).get('compatible') is not True:
-                return {'ok': True, 'status': 'waiting', 'reason': 'workspace_incompatible', 'job_id': jid}
-        prepared = {'job_id': jid, 'status': 'validated', 'original_id': args.id, 'new_id': report['new_thread_id'],
-                    'source_records': sources, 'title': title, 'merged_turns': report['merged_turns'], 'merged_items': report['merged_items']}
-        sync.atomic_json(job / 'job.json', prepared)
+            current = sync.records(endpoint.inspect(side)).get(args.id)
+            if not current or current['revision'] != sources[side]['revision'] or sync.is_busy(current, config.get('quiet_seconds', 60)):
+                return {'ok': True, 'status': 'waiting', 'reason': 'source_changed'}
+        choice = {'choice_id': jid, 'id': args.id, 'keep_side': args.keep_side, 'status': 'pending',
+                  'expected': {side: record['revision'] for side, record in sources.items()},
+                  'package_hashes': hashes, 'created_at': sync.utc_now()}
+        for side in ('windows', 'wsl'):
+            sync.conflict_choice_package(runtime, choice, side)
         sync.atomic_json(job / 'ledger-before.json', ledger)
-        return finish_job(sync, endpoint, runtime, ledger, job, prepared)
+        sync.atomic_json(job / 'choice.json', choice)
+        store = sync.read_conflict_choices(runtime)
+        store['choices'][args.id] = choice
+        sync.atomic_json(runtime / 'conflict-choices.json', store)
+        return {'ok': True, 'status': 'choice_saved', 'reason': 'waiting_for_safe_sync',
+                'choice_id': jid, 'id': args.id, 'keep_side': args.keep_side}
+    jid = str(uuid.uuid4())
+    job = jobs / jid
+    job.mkdir(parents=True, mode=0o700)
+    sources = {}
+    for side in ('windows', 'wsl'):
+        record = sync.records(views[side])[args.id]
+        destination = job / side
+        native = str(destination) if side == 'windows' else sync.linux_mount_path(destination)
+        endpoint.call(side, 'export', '--id', args.id, '--package', native, '--expected', record['revision'])
+        sources[side] = record
+    title = selected['label'][:60] + '（Win与WSL合并副本）'
+    report = merge_packages(job / 'windows', job / 'wsl', job / 'copy', title)
+    validate_native(sync, config, job, job / 'copy' / 'merged')
+    for side in ('windows', 'wsl'):
+        rows = sync.records(endpoint.inspect(side))
+        current = rows.get(args.id)
+        if not current or current['revision'] != sources[side]['revision'] or current.get('active'):
+            return {'ok': True, 'status': 'waiting', 'reason': 'source_changed', 'job_id': jid}
+        target = str(job / 'copy' / 'merged') if side == 'windows' else sync.linux_mount_path(job / 'copy' / 'merged')
+        if endpoint.call(side, 'import-preview', '--package', target).get('compatible') is not True:
+            return {'ok': True, 'status': 'waiting', 'reason': 'workspace_incompatible', 'job_id': jid}
+    prepared = {'job_id': jid, 'status': 'validated', 'original_id': args.id, 'new_id': report['new_thread_id'],
+                'source_records': sources, 'title': title, 'merged_turns': report['merged_turns'], 'merged_items': report['merged_items']}
+    sync.atomic_json(job / 'job.json', prepared)
+    sync.atomic_json(job / 'ledger-before.json', ledger)
+    return finish_job(sync, endpoint, runtime, ledger, job, prepared)
 
 
 def main():
@@ -245,6 +263,7 @@ def main():
     group.add_argument('--resume')
     parser.add_argument('--keep-side', choices=('windows', 'wsl'))
     parser.add_argument('--expected-token')
+    parser.add_argument('--progress-request-id', type=lambda value: str(uuid.UUID(value)))
     args = parser.parse_args()
     if args.id and not args.keep_side:
         parser.error('--id requires --keep-side; only historical merge jobs may use --resume')

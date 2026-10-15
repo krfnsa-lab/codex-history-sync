@@ -1,6 +1,6 @@
-# Codex History Sync 1.0.1
+# Codex History Sync 1.1.0
 
-在 VS Code 的 Remote WSL 窗口检查 Windows 聊天更新，提供手动应用及冲突选端入口。基础同步脚本版本为 2.1.1。
+在 VS Code 的 Remote WSL 窗口检查 Windows 聊天更新，提供实时进度、手动应用及冲突选端入口。基础同步脚本版本为 2.2.0。
 
 ## 日常使用
 
@@ -13,6 +13,16 @@
 普通同步、冲突选择、设置及恢复操作互斥。后台定时任务共享同步锁；正在回复、运行工具、未保存编辑文件、调试、多个窗口或无法确认进程归属时等待。确认记录数实际传输后才显示“已同步”，没有传输的检查显示等待原因。
 
 可选 reloadMode=automatic 需要主动选择，并通过设置命令或首次手动检查明确接受自动重载。Codex 没有读取未发送草稿的接口，自动模式无法保证这些草稿保留；默认确认模式因此不会无人值守地重载窗口。
+
+## 查看实时进度
+
+- 底部状态栏显示当前阶段、正在处理的序号和用时；有准确总数时显示实际数量。
+- 手动检查显示右下角进度通知。自动检查更新状态栏，保持现有默认确认行为。
+- 检查正在运行时再次点击状态栏，直接显示当前进度，并打开 **输出 → Codex History Sync**；也可按 F1 运行 **Codex History: Show Sync Progress**。
+- 详情记录阶段变化、实际已处理/已同步/暂缓数量及等待原因；没有已知总量的步骤不显示估算百分比。“已处理”包括本轮检查后暂缓的聊天，不等于已经同步。
+- 超过 30 秒没有新进度时显示“等待进度更新，尚未确认同步结果”；通知关闭、文件损坏或旧运行的结果都不能证明本轮成功。
+
+仅检查或同步运行期间每秒读取本地小型进度快照，结束后停止刷新。不新增常驻服务，不扫描聊天正文来制作界面，也不在进度文件中写聊天标题、正文、路径或凭据。完整说明见[同步进度](../docs/PROGRESS.md)。
 
 ## 安装与升级
 
@@ -29,7 +39,7 @@
 
 升级保留个人配置、完整运行目录和备份，使用新源码重新运行安装器，再重载窗口。已启用的旧用户默认转为确认后应用；自动重载需主动接受。安装器原子替换辅助文件，相同内容的运行中 Windows 启动器不重复替换。
 
-入口：**Check for New Messages** 检查/应用、**Resolve Chat Conflicts** 选择保留版本、**Enable Automatic Sync** 启用检查、**Disable Automatic Sync** 停用检查、**Disable and Restore Original Codex** 恢复原设置。
+入口：**Check for New Messages** 检查/应用、**Show Sync Progress** 查看进度详情、**Resolve Chat Conflicts** 选择保留版本、**Enable Automatic Sync** 启用检查、**Disable Automatic Sync** 停用检查、**Disable and Restore Original Codex** 恢复原设置。
 
 ## 安装位置与资源
 

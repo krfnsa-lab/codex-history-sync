@@ -81,7 +81,7 @@ def install(config_path, dry_run=False, controller_path=None):
         controller = config_path.parent / 'history_sync.py'
     if not controller.is_file():
         raise RuntimeError('Use the existing configured history synchronizer config')
-    controller, _, config, _ = load_controller(controller, config_path)
+    controller, _, config, runtime = load_controller(controller, config_path)
     python = Path(config['python_windows']).resolve(strict=True)
     if python != Path(sys.executable).resolve():
         raise RuntimeError('Run the installer using the synchronizer Windows Python')
@@ -112,18 +112,20 @@ def install(config_path, dry_run=False, controller_path=None):
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return
     destination.mkdir(parents=True, exist_ok=True)
-    atomic_copy(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
+    # Publish shared dependencies before entry points used by an open window.
+    for name in ('history_progress.py', 'history_merge.py', 'merge_validate.py', 'history_endpoint.py', 'merge_chat.py'):
+        atomic_copy(ROOT.parent / name, destination / name)
     atomic_copy(ROOT / 'native_local_probe.py', destination / 'native_local_probe.py')
     atomic_copy(ROOT / 'native_backend_probe.py', destination / 'native_backend_probe.py')
-    for name in ('merge_chat.py', 'history_merge.py', 'merge_validate.py', 'history_endpoint.py'):
-        atomic_copy(ROOT.parent / name, destination / name)
+    atomic_copy(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
     version = json.loads((ROOT / 'vscode-extension/package.json').read_text(encoding='utf-8'))['version']
     vsix = package(ROOT / ('dist/codex-history-live-sync-' + version + '.vsix'))
     atomic_copy(ROOT / 'vscode-extension/bin/windows/codex-history-sync-bridge.exe', wrapper, launcher=True)
     manifest.write_text(json.dumps({'owner': OWNER, 'binary': max(native)[1]}, indent=2), encoding='utf-8')
     setup = {'windowsPython': mount(python), 'windowsController': str(controller), 'windowsConfig': str(config_path),
              'previewHelper': str(destination / 'preview_sync.py'), 'mergeHelper': str(destination / 'merge_chat.py'),
-             'intervalSeconds': 60, 'controllerTimeoutSeconds': 600}
+             'intervalSeconds': 60, 'controllerTimeoutSeconds': 600,
+             'progressFile': mount(runtime / 'progress.json')}
     # Native Linux owns Linux configuration and gateway files.
     script = '''import json,os,pathlib,shutil,sys
 p=json.load(sys.stdin)

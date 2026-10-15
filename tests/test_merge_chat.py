@@ -268,6 +268,30 @@ class ManualChoiceTransaction(unittest.TestCase):
         self.assertEqual(self.saved_ledger(), self.ledger)
         self.assertFalse((self.runtime / 'pending.json').exists())
 
+    def test_saved_choice_progress_is_waiting_and_never_claims_transferred(self):
+        self.args.progress_request_id = '40000000-0000-4000-8000-000000000001'
+        result = self.select()
+        progress = json.loads((self.runtime / 'progress.json').read_text())
+        self.assertEqual(result['status'], 'choice_saved')
+        self.assertEqual((progress['kind'], progress['request_id'], progress['status']),
+                         ('choice', self.args.progress_request_id, 'waiting'))
+        self.assertEqual((progress['processed_chats'], progress['total_chats']), (1, 1))
+        self.assertEqual(progress.get('transferred_chats', 0), 0)
+        self.assertEqual([call[1] for call in self.endpoint.calls], ['export', 'export'])
+        self.assertEqual(self.saved_ledger(), self.ledger)
+
+    def test_list_progress_is_read_only_check_not_choice_or_transfer(self):
+        self.args.list = True
+        self.args.progress_request_id = '40000000-0000-4000-8000-000000000002'
+        result = self.select()
+        progress = json.loads((self.runtime / 'progress.json').read_text())
+        self.assertEqual(result['status'], 'candidates')
+        self.assertEqual((progress['kind'], progress['request_id'], progress['status']),
+                         ('check', self.args.progress_request_id, 'completed'))
+        self.assertEqual(progress.get('transferred_chats', 0), 0)
+        self.assertFalse(self.endpoint.calls)
+        self.assertFalse((self.runtime / 'conflict-choices.json').exists())
+
     def test_export_race_preserves_partial_backup_and_never_saves_decision(self):
         self.endpoint.after_export = lambda side: self.endpoint.rows[side].update(revision='changed-' + side)
         self.assertEqual(self.select()['reason'], 'source_changed')

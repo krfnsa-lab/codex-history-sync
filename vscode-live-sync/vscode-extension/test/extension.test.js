@@ -33,10 +33,11 @@ function load({ platform = 'linux', overrides = {}, pause = false, accept = true
     commands: { registerCommand: (name, callback) => { commands.set(name, callback); return disposable; }, executeCommand: async name => { calls.push(['command', name]); } },
     window: {
       createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+      createOutputChannel: () => ({ appendLine: message => calls.push(['output', message]), show: () => calls.push(['output-show']), dispose() {} }),
       showWarningMessage: async (message, options, action) => { calls.push(['warning', message, options, action]); return options?.modal && accept ? action : options === '处理聊天冲突' && mergeFromWarning ? options : undefined; },
       showInformationMessage: async message => { calls.push(['info', message]); },
       showQuickPick: async (items, options) => { calls.push(['pick', items, options]); return options.title === '选择保留哪一端' ? items.find(item => item.keepSide === resolution) : pick ? items[0] : undefined; },
-      withProgress: async (options, callback) => { calls.push(['progress', options]); return callback(); }
+      withProgress: async (options, callback) => { calls.push(['progress', options]); return callback({ report: event => calls.push(['progress-report', event]) }); }
     }
   };
   const context = { extensionPath: '/preview', subscriptions: [], globalState: { get: (key, fallback) => state.has(key) ? state.get(key) : fallback, update: async (key, value) => { state.set(key, value); } } };
@@ -45,6 +46,7 @@ function load({ platform = 'linux', overrides = {}, pause = false, accept = true
     if (name === 'node:fs') return { existsSync: value => value.endsWith('pause.json') ? pause : true };
     if (name === 'node:os') return { homedir: () => '/home/example-user' };
     if (name === 'node:path') return platform === 'linux' ? path.posix : path.win32;
+    if (name === './progress') return require('../progress');
     if (name === './bridge') return { validateConfig, describeResult, readPrivateJson: async file => { calls.push(['read-installation', file]); return { wrappers_installed: true, setupSettings: proposed }; }, runWindows: async () => ({ safe_to_reload: true }),
       runMergeWindows: async (_, action) => { calls.push(['merge', action]); const result = mergeResults.shift() || { ok: true, status: 'candidates', chats: [] }; if (result instanceof Error) throw result; return result; }, Coordinator: class {
       constructor(_, dependencies) { coordinatorDependencies = dependencies; constructors += 1; }
@@ -371,7 +373,7 @@ test('cancelled chat, side or risk confirmation never saves a version choice', a
     const f = load({ configured: true, ...options, mergeResults: [candidateListing] });
     await f.commands.get('codexHistoryLiveSync.resolveConflicts')();
     assert.equal(f.calls.filter(call => call[0] === 'merge').length, 1);
-    assert.ok(!f.calls.some(call => call[0] === 'progress'));
+    assert.ok(!f.calls.some(call => call[0] === 'merge' && call[1].type === 'id'), 'Read-only progress may show, but cancellation never saves a choice');
   }
 });
 
@@ -380,7 +382,7 @@ test('busy, incomplete or unbound candidates are never offered for version selec
     const f = load({ configured: true, mergeResults: [{ ...candidateListing, chats: [{ ...candidateListing.chats[0], ...changes }] }] });
     await f.commands.get('codexHistoryLiveSync.resolveConflicts')();
     assert.equal(f.calls.filter(call => call[0] === 'merge').length, 1);
-    assert.ok(!f.calls.some(call => call[0] === 'pick' || call[0] === 'progress'));
+    assert.ok(!f.calls.some(call => call[0] === 'pick' || (call[0] === 'merge' && call[1].type === 'id')));
     assert.ok(f.calls.some(call => call[0] === 'info' && call[1].includes('60 秒')));
   }
 });
@@ -389,7 +391,7 @@ test('historical pending import blocks new choices and never offers automatic me
   const f = load({ configured: true, mergeResults: [{ ok: true, status: 'waiting', reason: 'pending_import', resume_job_id: jobId }] });
   await f.commands.get('codexHistoryLiveSync.resolveConflicts')();
   assert.equal(f.calls.filter(call => call[0] === 'merge').length, 1);
-  assert.ok(!f.calls.some(call => call[0] === 'pick' || call[0] === 'progress'));
+  assert.ok(!f.calls.some(call => call[0] === 'pick' || (call[0] === 'merge' && call[1].type === 'id')));
   assert.ok(f.calls.some(call => call[0] === 'warning' && call[1].includes('恢复记录')));
 });
 
@@ -462,7 +464,7 @@ test('cancelled conflict action, ordinary checks and automatic conflict checks n
   await f.commands.get('codexHistoryLiveSync.checkNow')();
   f.timers.at(-1)(); await settle();
   assert.equal(f.calls.filter(call => call[0] === 'warning' && call[2] === '处理聊天冲突').length, before);
-  assert.ok(!f.calls.some(call => call[0] === 'merge' || call[0] === 'pick' || call[0] === 'progress'));
+  assert.ok(!f.calls.some(call => call[0] === 'merge' || call[0] === 'pick' || (call[0] === 'merge' && call[1].type === 'id')));
 });
 
 test('legacy merge command id remains an alias for explicit side selection, without creating a copy', async () => {
@@ -479,4 +481,30 @@ test('a stale saved choice offers a fresh explicit version selection from the st
   await f.commands.get('codexHistoryLiveSync.checkNow')();
   assert.ok(f.calls.some(call => call[0] === 'warning' && call[2] === '处理聊天冲突' && call[1].includes('版本已经变化')));
   assert.ok(!f.calls.some(call => call[0] === 'merge'));
+});
+
+test('a stalled or failed progress notification cannot retain the actual check guard', async () => {
+  for (const mode of ['stalled', 'throw', 'reject']) {
+    const f = load({ review: true, recoveryResults: [{ kind: 'recovered' }] }); await settle();
+    f.vscode.window.withProgress = () => {
+      if (mode === 'throw') throw Error('UI failed');
+      return mode === 'reject' ? Promise.reject(Error('UI failed')) : new Promise(() => {});
+    };
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    assert.equal(f.calls.filter(call => call[0] === 'check').length, 2);
+  }
+});
+
+test('repeated manual check opens the existing operation details instead of launching a check or busy notice', async () => {
+  let resolve; const pending = new Promise(done => { resolve = done; });
+  const f = load({ review: true, recoveryResults: [{ kind: 'recovered' }], checkResults: [pending] }); await settle();
+  const running = f.commands.get('codexHistoryLiveSync.checkNow')();
+  const notifications = f.calls.filter(call => call[0] === 'progress').length;
+  await f.commands.get('codexHistoryLiveSync.checkNow')(); await f.commands.get('codexHistoryLiveSync.showProgress')();
+  assert.equal(f.calls.filter(call => call[0] === 'check').length, 1);
+  assert.equal(f.calls.filter(call => call[0] === 'progress').length, notifications);
+  assert.ok(f.calls.some(call => call[0] === 'output-show'));
+  assert.ok(!f.calls.some(call => call[0] === 'info' && call[1].includes('已有同步检查')));
+  resolve({ kind: 'current', reason: 'no_pending_updates' }); await running;
 });

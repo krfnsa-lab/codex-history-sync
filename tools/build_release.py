@@ -19,15 +19,15 @@ import zipfile
 
 ARCHIVE_ROOT = "codex-history-sync"
 REQUIRED_FILES = frozenset((
-    "history_endpoint.py", "history_sync.py", "history_merge.py", "merge_chat.py", "merge_validate.py", "setup.py", "config.example.json",
+    "history_endpoint.py", "history_sync.py", "history_progress.py", "history_merge.py", "merge_chat.py", "merge_validate.py", "setup.py", "config.example.json",
     "install.ps1", "uninstall.ps1", "sync-now.ps1", "status.ps1", "doctor.ps1", "repair-paths.ps1",
     "configure.ps1", "Common.ps1", "README.md", "CHANGELOG.md", "LICENSE", ".gitignore",
-    "docs/SAFETY.md", "docs/CONFIGURATION.md", ".github/workflows/ci.yml",
+    "docs/SAFETY.md", "docs/CONFIGURATION.md", "docs/PROGRESS.md", ".github/workflows/ci.yml",
     "tools/build_release.py", "tests/test_endpoint.py", "tests/test_diagnostics.py",
     "tests/test_history_endpoint_review.py", "tests/test_history_sync_review.py",
     "tests/test_prefer_longer.py", "tests/test_prefer_longer_backup.py",
     "tests/test_merge.py",
-    "tests/test_merge_chat.py", "tests/test_merge_validate.py",
+    "tests/test_merge_chat.py", "tests/test_merge_validate.py", "tests/test_progress.py", "tests/test_endpoint_progress.py",
 ))
 OPTIONAL_ROOT_FILES = frozenset(("CONTRIBUTING.md", "SECURITY.md", "VALIDATION.md"))
 LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (
@@ -35,12 +35,13 @@ LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (
     'linux_launcher.py', 'preview_sync.py', 'recover.py', 'recover.ps1', 'README.md', 'LICENSE',
     'THIRD_PARTY_NOTICES.md', 'DISTLIB-LICENSE.txt', 'WINDOWS-LAUNCHER-LICENSE.txt',
     'tests/test_preview.py', 'tests/test_gateway.py', 'tests/test_recovery.py',
+    'tests/test_preview_progress.py',
     'tests/test_windows_launcher.py', 'tests/native_smoke.py',
     'tests/test_install_config.py',
     'native_local_probe.py', 'tests/test_native_local_probe.py',
     'native_backend_probe.py', 'tests/test_native_backend_probe.py',
-    'vscode-extension/package.json', 'vscode-extension/bridge.js', 'vscode-extension/extension.js',
-    'vscode-extension/README.md', 'vscode-extension/test/bridge.test.js', 'vscode-extension/test/extension.test.js',
+    'vscode-extension/package.json', 'vscode-extension/bridge.js', 'vscode-extension/extension.js', 'vscode-extension/progress.js',
+    'vscode-extension/README.md', 'vscode-extension/test/bridge.test.js', 'vscode-extension/test/extension.test.js', 'vscode-extension/test/progress.test.js',
 ))
 REQUIRED_FILES = REQUIRED_FILES | LIVE_SYNC_FILES
 IGNORED_DIRECTORIES = frozenset((

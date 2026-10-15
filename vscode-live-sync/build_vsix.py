@@ -25,7 +25,7 @@ def package(output):
 <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
 <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/LICENSE" Addressable="true"/></Assets></PackageManifest>'''
     content_types = '''<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="json" ContentType="application/json"/><Default Extension="vsixmanifest" ContentType="text/xml"/><Default Extension="js" ContentType="application/javascript"/><Default Extension="py" ContentType="text/plain"/><Default Extension="md" ContentType="text/markdown"/><Default Extension="exe" ContentType="application/octet-stream"/><Default Extension="" ContentType="application/octet-stream"/></Types>'''
-    files = {name: extension / name for name in ['package.json', 'extension.js', 'bridge.js', 'README.md']}
+    files = {name: extension / name for name in ['package.json', 'extension.js', 'bridge.js', 'progress.js', 'README.md']}
     files.update({'gateway.py': ROOT / 'gateway.py', 'LICENSE': ROOT / 'LICENSE',
                   'DISTLIB-LICENSE.txt': ROOT / 'DISTLIB-LICENSE.txt', 'THIRD_PARTY_NOTICES.md': ROOT / 'THIRD_PARTY_NOTICES.md',
                   'WINDOWS-LAUNCHER-LICENSE.txt': ROOT / 'WINDOWS-LAUNCHER-LICENSE.txt',

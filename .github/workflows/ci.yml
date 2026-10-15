@@ -55,4 +55,4 @@ jobs:
         with:
           node-version: '22'
       - name: Run optional bridge coordinator and setup tests
-        run: node --test vscode-live-sync/vscode-extension/test/bridge.test.js vscode-live-sync/vscode-extension/test/extension.test.js
+        run: node --test vscode-live-sync/vscode-extension/test/bridge.test.js vscode-live-sync/vscode-extension/test/extension.test.js vscode-live-sync/vscode-extension/test/progress.test.js

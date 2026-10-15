@@ -543,3 +543,36 @@ test('merge runner handles safe JSON and hides process errors, private paths and
   }
 });
 
+
+test('progress callbacks receive distinct request UUIDs and cannot change the guarded synchronization outcome', async t => {
+  const events = []; const requests = [];
+  const f = await fixture(t, {
+    onProgress: event => { events.push(event); throw Error('optional progress renderer failed'); },
+    runWindows: async (_, mode, requestId) => {
+      requests.push({ mode, requestId });
+      return mode === 'recovery' ? { safe_to_reload: true } : mode === true ? { eligible: true, candidate_ids: ['test'] } : { status: 'completed', transferred: 1 };
+    }
+  });
+  assert.equal((await f.coordinator.check()).kind, 'synced');
+  assert.equal(requests.length, 3); assert.equal(new Set(requests.map(row => row.requestId)).size, 3);
+  for (const row of requests) {
+    assert.match(row.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.ok(events.some(event => event.requestId === row.requestId && event.newOperation === true));
+  }
+  assert.ok(events.some(event => event.phase === 'confirming')); assert.ok(events.some(event => event.phase === 'pausing'));
+  assert.ok(events.some(event => event.phase === 'reloading')); assert.equal(f.coordinator.running, false);
+  assert.ok(f.calls.includes('prepare_pause')); assert.ok(f.calls.includes('reload'));
+});
+
+test('progress-path mode is read-only and request identities are passed as exact arguments', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-progress-helper-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, 'fake-python'); const capture = path.join(directory, 'argv');
+  await fs.writeFile(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > '${capture.replace(/'/g, "'\\''")}'\nprintf '%s\\n' '{"progress_file":"/mnt/c/Sync/runtime/progress.json"}'\n`, { mode: 0o700 });
+  const config = { windowsPython: executable, previewHelper: 'C:\\Sync\\preview_sync.py', windowsController: 'C:\\Sync\\history_sync.py', windowsConfig: 'C:\\Sync\\config.json' };
+  assert.equal((await runWindows(config, 'progress-path')).progress_file, '/mnt/c/Sync/runtime/progress.json');
+  const first = (await fs.readFile(capture, 'utf8')).trim().split('\n'); assert.ok(first.includes('--progress-path')); assert.ok(!first.includes('--sync-once'));
+  const id = '55555555-5555-4555-8555-555555555555'; await runWindows(config, true, id);
+  const second = (await fs.readFile(capture, 'utf8')).trim().split('\n'); assert.deepEqual(second.slice(-2), ['--progress-request-id', id]);
+  await assert.rejects(runWindows(config, true, '------------------------------------'), /Invalid progress request/);
+});

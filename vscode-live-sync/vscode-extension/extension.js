@@ -3,9 +3,11 @@ const vscode = require('vscode');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
+const { ProgressDisplay } = require('./progress');
 const { Coordinator, validateConfig, readPrivateJson, runWindows, runMergeWindows, describeResult } = require('./bridge');
 let timer; let coordinator; let status; let lastError = '';
-let extensionContext;
+let extensionContext; let progress;
 let setupInProgress = false;
 let recoveryInProgress = false;
 let disableGeneration = 0;
@@ -79,7 +81,7 @@ async function setup(context) {
     const file = path.join(os.homedir(), '.config', 'codex-history-sync-live', 'launcher.json');
     const installation = await readPrivateJson(file);
     if (installation.wrappers_installed !== true || !installation.setupSettings || typeof installation.setupSettings !== 'object') throw new Error('安装配置不完整，请先运行安装程序。');
-    const keys = ['intervalSeconds', 'controllerTimeoutSeconds', 'stateDir', 'windowsPython', 'windowsController', 'windowsConfig', 'previewHelper', 'mergeHelper'];
+    const keys = ['intervalSeconds', 'controllerTimeoutSeconds', 'stateDir', 'windowsPython', 'windowsController', 'windowsConfig', 'previewHelper', 'mergeHelper', 'progressFile'];
     const proposed = Object.fromEntries(keys.map(key => [key, installation.setupSettings[key]]));
     validateConfig(proposed);
     if (!canReload()) throw new Error('请先保存编辑器中的文件并停止调试，再完成设置。');
@@ -151,7 +153,7 @@ async function disableRestore(context) {
 
 function settings() {
   const config = vscode.workspace.getConfiguration(section);
-  return Object.fromEntries(['enabled', 'reloadMode', 'intervalSeconds', 'controllerTimeoutSeconds', 'stateDir', 'windowsPython', 'windowsController', 'windowsConfig', 'previewHelper', 'mergeHelper'].map(key => [key, config.get(key)]));
+  return Object.fromEntries(['enabled', 'reloadMode', 'intervalSeconds', 'controllerTimeoutSeconds', 'stateDir', 'windowsPython', 'windowsController', 'windowsConfig', 'previewHelper', 'mergeHelper', 'progressFile'].map(key => [key, config.get(key)]));
 }
 
 function isWsl() { return process.platform === 'linux' && vscode.env.remoteName === 'wsl'; }
@@ -205,11 +207,14 @@ async function mergeChats() {
     notify('showWarningMessage', '已有暂停保护，请先完成同步恢复检查，再选择聊天版本。'); return;
   }
   mergeInProgress = true;
+  progress?.begin(config, true, 'planning');
   const generation = configurationGeneration;
   const disableAtStart = disableGeneration;
   const current = () => generation === configurationGeneration && disableAtStart === disableGeneration;
   try {
-    const listing = await runMergeWindows(config, { type: 'list' });
+    const listingRequest = crypto.randomUUID();
+    progress?.local({ phase: 'planning', requestId: listingRequest, newOperation: true });
+    const listing = await runMergeWindows(config, { type: 'list' }, listingRequest);
     if (!current()) return;
     if (listing.ok !== true || listing.status !== 'candidates' || !Array.isArray(listing.chats)) {
       notify('showWarningMessage', mergeWaitingMessage(listing)); return;
@@ -224,6 +229,7 @@ async function mergeChats() {
     if (!choices.length) {
       notify('showInformationMessage', listing.chats.length ? '冲突聊天尚未空闲或无法可靠比较。请静置两端这条聊天至少 60 秒后重新检查。' : '没有待处理的聊天冲突。'); return;
     }
+    progress?.local({ phase: 'choosing' });
     const chosen = await vscode.window.showQuickPick(choices, { title: '选择有冲突的聊天', placeHolder: '手动决定保留 Windows 还是 WSL 的版本', canPickMany: false });
     if (!chosen) return;
     const methods = [
@@ -237,8 +243,9 @@ async function mergeChats() {
     const accepted = await vscode.window.showWarningMessage(`确定以 ${source} 为准吗？安全同步时将先完整备份两端，再用当前 ${source} 版本替换 ${target} 的聊天。${target} 独有的消息会从聊天中移除，只保留在备份中。两端这条聊天在完成同步前请停止发送消息；版本变化后需要重新选择。`, { modal: true }, `保留 ${source} 版本`);
     if (accepted !== `保留 ${source} 版本` || !current()) return;
     const action = { type: 'id', value: chosen.id, keepSide: method.keepSide, expectedToken: chosen.choiceToken };
-    const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在备份并保存聊天版本选择', cancellable: false },
-      () => runMergeWindows(config, action));
+    const choiceRequest = crypto.randomUUID();
+    progress?.local({ phase: 'choice', requestId: choiceRequest, newOperation: true });
+    const result = await runMergeWindows(config, action, choiceRequest);
     if (result.ok === true && result.status === 'choice_saved' && result.reason === 'waiting_for_safe_sync' &&
         result.id === chosen.id && result.keep_side === method.keepSide) {
       notify('showInformationMessage', `已保存以 ${source} 为准的选择，尚未同步。等待 ${target} Codex 后端停止、两端聊天保持空闲后，定时任务会更新对端；若版本发生变化，需重新确认。不会创建聊天副本。`);
@@ -246,6 +253,7 @@ async function mergeChats() {
   } catch {
     notify('showWarningMessage', '冲突处理未完成。请检查恢复记录或重新安装冲突处理工具后重试。');
   } finally {
+    progress?.finish();
     mergeInProgress = false;
     if (configurePending) { configurePending = false; configure(false); }
   }
@@ -253,7 +261,7 @@ async function mergeChats() {
 
 async function check(manual = false) {
   if (mergeInProgress || checkInProgress) {
-    if (manual) notify('showInformationMessage', '已有同步检查正在进行，请等待本轮结束。');
+    if (manual) progress?.show();
     return;
   }
   if (!coordinator) {
@@ -261,7 +269,8 @@ async function check(manual = false) {
     return;
   }
   checkInProgress = true;
-  let feedback;
+  progress?.begin(settings(), manual);
+  let feedback; let finalResult; let failed = false;
   try {
     if (extensionContext.globalState.get('needsReview')) {
       if (!manual && extensionContext.globalState.get('reviewRecoverySuppressed')) return;
@@ -272,7 +281,7 @@ async function check(manual = false) {
       recoveryInProgress = true;
       const generation = disableGeneration;
       try {
-        const recovered = await coordinator.recover();
+        const recovered = await coordinator.recover(); finalResult = recovered;
         if (recovered.kind === 'recovered') {
           if (generation !== disableGeneration) return;
           await extensionContext.globalState.update('reviewError', undefined);
@@ -306,7 +315,7 @@ async function check(manual = false) {
         configurePending = true;
       }
     }
-    const result = await coordinator.check({ manual });
+    const result = await coordinator.check({ manual }); finalResult = result;
     const presentation = describeResult(result);
     status.text = presentation.text;
     status.tooltip = presentation.detail; lastError = '';
@@ -316,12 +325,14 @@ async function check(manual = false) {
         message: presentation.detail, conflicts: hasConflicts };
     }
   } catch (error) {
+    failed = true;
     const message = failureMessage(error);
     status.text = '$(warning) Codex：同步待处理';
     status.tooltip = message;
     if (manual && lastError !== message) feedback = { method: 'showWarningMessage', message };
     lastError = message;
   } finally {
+    progress?.finish(finalResult, failed);
     checkInProgress = false;
     if (configurePending) { configurePending = false; configure(false); }
     reportCheck(feedback);
@@ -331,6 +342,7 @@ async function check(manual = false) {
 function configure(initialCheck = true) {
   if (mergeInProgress || checkInProgress || recoveryInProgress || coordinator?.running) { configurePending = true; return; }
   if (timer) clearInterval(timer); timer = null; coordinator = null;
+  progress?.stop();
   const config = settings();
   if (setupInProgress) return;
   process.env.CODEX_HISTORY_SYNC_STATE_DIR = config.stateDir || '';
@@ -349,6 +361,7 @@ function configure(initialCheck = true) {
     const generation = configurationGeneration;
     const disableAtStart = disableGeneration;
     coordinator = new Coordinator(config, {
+      onProgress: event => progress?.local(event),
       shouldContinue: () => generation === configurationGeneration && disableAtStart === disableGeneration && settings().enabled === true,
       confirmReload: async manual => {
         if (config.reloadMode === 'automatic' && extensionContext.globalState.get('automaticReloadAccepted') === true) return true;
@@ -387,6 +400,7 @@ function activate(context) {
   bootstrapGateway(context);
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 10);
   status.command = 'codexHistoryLiveSync.checkNow';
+  progress = new ProgressDisplay(vscode, status, { readPrivate: readPrivateJson, runWindows, setInterval, clearInterval });
   context.subscriptions.push(status,
     vscode.commands.registerCommand('codexHistoryLiveSync.setup', () => setup(context)),
     vscode.commands.registerCommand('codexHistoryLiveSync.configureGateway', () => configureGateway(context)),
@@ -403,6 +417,7 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('codexHistoryLiveSync.disable', disable),
     vscode.commands.registerCommand('codexHistoryLiveSync.checkNow', () => check(true)),
+    vscode.commands.registerCommand('codexHistoryLiveSync.showProgress', () => progress?.show()),
     vscode.commands.registerCommand('codexHistoryLiveSync.resolveConflicts', mergeChats),
     vscode.commands.registerCommand('codexHistoryLiveSync.mergeChats', mergeChats),
     vscode.workspace.onDidChangeConfiguration(event => {
@@ -411,9 +426,9 @@ function activate(context) {
         configure();
       }
     }),
-    { dispose: () => { if (timer) clearInterval(timer); } }
+    { dispose: () => { if (timer) clearInterval(timer); progress?.dispose(); } }
   );
   configure();
 }
-function deactivate() { if (timer) clearInterval(timer); }
+function deactivate() { if (timer) clearInterval(timer); progress?.dispose(); }
 module.exports = { activate, deactivate };

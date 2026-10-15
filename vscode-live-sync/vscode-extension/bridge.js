@@ -40,8 +40,12 @@ function mergeArguments(config, action) {
   return [...args, '--id', action.value, '--keep-side', action.keepSide, '--expected-token', action.expectedToken];
 }
 
-async function runMergeWindows(config, action) {
+async function runMergeWindows(config, action, requestId) {
   const args = mergeArguments(config, action);
+  if (requestId !== undefined) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) throw new Error("Invalid progress request.");
+    args.push("--progress-request-id", requestId);
+  }
   try {
     const { stdout } = await execFileAsync(config.windowsPython, args, {
       timeout: Math.max(1200, config.controllerTimeoutSeconds || 600) * 1000,
@@ -114,12 +118,18 @@ function request(instance, action) {
   });
 }
 
-async function runWindows(config, mode) {
-  const args = mode === 'recovery'
+async function runWindows(config, mode, requestId) {
+  const args = mode === 'progress-path'
+    ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--progress-path']
+    : mode === 'recovery'
     ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--recovery-state']
     : mode === true
     ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json']
     : [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--sync-once'];
+  if (requestId !== undefined) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) throw new Error('Invalid progress request.');
+    args.push('--progress-request-id', requestId);
+  }
   try {
     const { stdout } = await execFileAsync(config.windowsPython, args, {
       timeout: Math.max(180, Number(config.controllerTimeoutSeconds) || 600) * 1000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
@@ -242,6 +252,17 @@ class Coordinator {
     this.onFailure = dependencies.onFailure || (() => Promise.resolve());
     this.onDeferred = dependencies.onDeferred || (() => Promise.resolve());
     this.nextAttemptAt = dependencies.nextAttemptAt || (() => 0);
+    this.onProgress = dependencies.onProgress || (() => {});
+  }
+
+  progress(phase, extra = {}) {
+    try { const pending = this.onProgress({ phase, ...extra }); pending?.catch?.(() => {}); } catch { /* Progress is optional and cannot change safety decisions. */ }
+  }
+
+  async callWindows(mode) {
+    const requestId = crypto.randomUUID();
+    this.progress(mode === true ? 'checking' : mode === 'recovery' ? 'recovery' : 'starting', { requestId, newOperation: true });
+    return this.runWindows(this.config, mode, requestId);
   }
 
   async recover() {
@@ -268,13 +289,14 @@ class Coordinator {
     try {
       await secureDirectory(this.config.stateDir);
       if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
+      this.progress('gateway');
       const instances = await this.discover(this.config.stateDir);
       if (instances.length === 0) return { kind: 'unavailable', reason: 'gateway_unavailable' };
       if (instances.length !== 1) return { kind: 'waiting', reason: 'multiple_windows' };
       if (instances[0].parent_pid !== process.pid) return { kind: 'waiting', reason: 'other_window' };
       const first = await health(instances[0]);
       if (first) return { kind: 'waiting', reason: first };
-      if ((await this.runWindows(this.config, 'recovery'))?.safe_to_reload !== true) {
+      if ((await this.callWindows('recovery'))?.safe_to_reload !== true) {
         return { kind: 'blocked', reason: 'recovery_pending' };
       }
       if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
@@ -295,10 +317,11 @@ class Coordinator {
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled' };
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason() };
       if (Date.now() < this.nextAttemptAt()) return { kind: 'waiting', reason: 'retry_backoff' };
-      const preview = await this.runWindows(this.config, true);
+      const preview = await this.callWindows(true);
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (preview.eligible !== true || !Array.isArray(preview.candidate_ids) || preview.candidate_ids.length === 0) return previewResult(preview);
       if (Number.isFinite(preview.controller_timeout_seconds)) this.config.controllerTimeoutSeconds = Math.max(this.config.controllerTimeoutSeconds || 600, preview.controller_timeout_seconds);
+      this.progress('gateway');
       const instances = await this.discover(this.config.stateDir);
       if (instances.length === 0) return { kind: 'unavailable', reason: 'gateway_unavailable', preview };
       if (instances.length !== 1) return { kind: 'waiting', reason: 'multiple_windows', preview };
@@ -316,6 +339,7 @@ class Coordinator {
             !Number.isFinite(state.idle_seconds) || state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview };
       }
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
+      this.progress('confirming');
       if (!await this.confirmReload(options.manual === true)) return { kind: 'waiting', reason: 'reload_confirmation', preview };
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason(), preview };
@@ -328,6 +352,7 @@ class Coordinator {
       try { await handle.writeFile(JSON.stringify(lease)); await handle.sync(); } finally { await handle.close(); }
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!sameInstances(instances, await this.discover(this.config.stateDir))) return { kind: 'waiting', reason: 'instances_changed', preview };
+      this.progress('pausing');
       for (const instance of instances) {
         let paused;
         try { paused = await this.request(instance, 'prepare_pause'); }
@@ -348,7 +373,7 @@ class Coordinator {
       }
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!this.canReload()) throw new Error('Unsaved work appeared; the update was postponed.');
-      const result = await this.runWindows(this.config, false);
+      const result = await this.callWindows(false);
       if (result.status !== 'completed' && result.status !== 'skipped_already_running') throw new Error('The synchronizer needs review before another update.');
       if (result.status === 'skipped_already_running' || !Number.isInteger(result.transferred) || result.transferred < 1) {
         await this.onDeferred(Date.now() + 300000);
@@ -364,7 +389,7 @@ class Coordinator {
       try {
         if (pauseStarted) {
           let recovery;
-          try { recovery = await this.runWindows(this.config, 'recovery'); }
+          try { recovery = await this.callWindows('recovery'); }
           catch { recovery = { safe_to_reload: false }; }
           const safe = recovery?.safe_to_reload === true;
           if (operationFailed || !safe) await this.onFailure(operationError || new Error('无法确认同步恢复状态，暂停保护已保留。'));
@@ -377,6 +402,7 @@ class Coordinator {
           catch (error) { if (!operationFailed) await this.onFailure(error); throw error; }
           lease = null;
           // Verify that no controller/importer or unfinished journal exists before permitting a fresh backend.
+          this.progress('reloading');
           try { await this.reload(); }
           catch (error) { if (!operationFailed) await this.onFailure(error); throw error; }
         } else if (lease) {

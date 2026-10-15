@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import bisect
 import ctypes
+import contextvars
+import functools
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ METADATA_FIELDS = ("title", "name", "archived", "archived_at")
 INSPECT_FIELDS = ("id", "rollout_path", "source", "title", "name", "archived", "history_mode")
 CHUNK_SIZE = 512 * 1024
 MAX_ENVIRONMENT_RECORD_BYTES = 8 * 1024 * 1024
+_PROGRESS_CONTEXT = contextvars.ContextVar("endpoint_progress", default=None)
 CACHE_HASH_FIELDS = {
     "thread_turns": ("turn_id", "rollout_ordinal", "status", "error_json", "started_at", "completed_at", "duration_ms", "first_user_item_id", "final_agent_item_id", "rollout_byte_offset", "rollout_end_ordinal", "rollout_end_byte_offset"),
     "thread_items": ("turn_id", "item_id", "rollout_ordinal", "created_at_ms", "item_type", "updated_at_ordinal", "started_at_ms", "completed_at_ms"),
@@ -55,6 +58,71 @@ class EndpointError(Exception):
 
 def fail(code, message):
     raise EndpointError(code, message)
+
+
+def progress_update(phase, **fields):
+    """Best-effort telemetry must never participate in the history transaction."""
+    context = _PROGRESS_CONTEXT.get()
+    if context is None:
+        return
+    context.update(phase=phase, fields=fields, next_heartbeat=time.monotonic() + 1)
+    try:
+        context["writer"].update(phase, **fields)
+    except Exception:
+        pass
+
+
+def progress_heartbeat():
+    context = _PROGRESS_CONTEXT.get()
+    if context is not None and time.monotonic() >= context["next_heartbeat"]:
+        progress_update(context["phase"], **context["fields"])
+
+
+def endpoint_progress(phase):
+    def decorate(operation):
+        @functools.wraps(operation)
+        def run(args):
+            writer = getattr(args, "_progress", None)
+            context = {"writer": writer, "phase": phase, "fields": {}, "next_heartbeat": 0} if writer else None
+            token = _PROGRESS_CONTEXT.set(context)
+            try:
+                progress_update(phase)
+                result = operation(args)
+                if writer:
+                    try:
+                        writer.finish("completed", **context["fields"])
+                    except Exception:
+                        pass
+                return result
+            except BaseException:
+                if writer:
+                    try:
+                        writer.finish("error")
+                    except Exception:
+                        pass
+                raise
+            finally:
+                _PROGRESS_CONTEXT.reset(token)
+        return run
+    return decorate
+
+
+def configured_progress(args):
+    """An optional, fully identified detail writer; invalid telemetry is ignored."""
+    values = [getattr(args, name, None) for name in
+              ("progress_file", "progress_run_id", "progress_operation_id", "progress_side")]
+    if not all(values) or values[3] not in ("windows", "wsl"):
+        return None
+    try:
+        for value in values[1:3]:
+            if str(uuid.UUID(value)) != value:
+                return None
+        if not Path(values[0]).is_absolute():
+            return None
+        from history_progress import ProgressWriter
+        return ProgressWriter(values[0], run_id=values[1], operation_id=values[2], side=values[3])
+    except Exception:
+        return None
 
 
 def canonical(value):
@@ -217,6 +285,7 @@ def backend_status():
             "backend_kinds": {"native_codex": count}, "backend_guard_scope": "native_os_codex_processes"}
 
 
+@endpoint_progress("checking_backend")
 def backend_status_command(args):
     native_home(args.home)
     return {"ok": True, "platform": "windows" if os.name == "nt" else "linux", **backend_status()}
@@ -270,6 +339,7 @@ def file_signature(path):
     with path.open("rb") as stream:
         while True:
             chunk = stream.read(CHUNK_SIZE)
+            progress_heartbeat()
             if not chunk:
                 break
             hasher.update(chunk)
@@ -316,6 +386,7 @@ def cache_rows_digest(connection, table, thread_id, database="main"):
     for record in connection.execute(
         f"SELECT {','.join(selected)} FROM {quote(database)}.{quote(table)} WHERE thread_id=? ORDER BY {order}", (thread_id,)
     ):
+        progress_heartbeat()
         item = {name: record[name] for name in fields}
         if has_json:
             payload_hash = hashlib.sha256()
@@ -324,6 +395,7 @@ def cache_rows_digest(connection, table, thread_id, database="main"):
                 with connection.blobopen(table, "item_json", record["__rowid"], readonly=True, name=database) as blob:
                     while True:
                         data = blob.read(CHUNK_SIZE)
+                        progress_heartbeat()
                         if not data:
                             break
                         payload_hash.update(data)
@@ -438,6 +510,7 @@ def read_revision(home, thread_id, quiet_seconds=60):
             history.close()
 
 
+@endpoint_progress("scanning")
 def inspect_home(args):
     home = native_home(args.home)
     sources = scoped_sources(args.scope)
@@ -453,12 +526,18 @@ def inspect_home(args):
         available = set(columns(state, "threads"))
         selection = ",".join(quote(name) if name in available else "NULL AS " + quote(name) for name in INSPECT_FIELDS)
         query = "SELECT " + selection + " FROM threads WHERE source IN (" + ",".join("?" for _ in sources) + ") ORDER BY id"
+        total = state.execute("SELECT COUNT(*) FROM threads WHERE source IN (" +
+                              ",".join("?" for _ in sources) + ")", tuple(sorted(sources))).fetchone()[0]
+        processed = 0
+        progress_update("scanning", processed_records=processed, total_records=total)
         for record in state.execute(query, tuple(sorted(sources))):
             row = dict(record)
             try:
                 results.append(revision_from_connections(home, row, history, args.quiet_seconds))
             except EndpointError as error:
                 failures.append({"id": row["id"], "code": error.code})
+            processed += 1
+            progress_update("scanning", processed_records=processed, total_records=total)
         schema = {table: columns(history, table) for table in CACHE_TABLES if history is not None and table_exists(history, table)}
         return {"ok": True, "format_version": FORMAT_VERSION, "platform": "windows" if os.name == "nt" else "linux",
                 "threads": results, "skipped": failures, "cache_schema": schema,
@@ -604,6 +683,7 @@ def diagnostic_record_counts(home, sources, state_info, history_info):
     return result
 
 
+@endpoint_progress("reading")
 def doctor_home(args):
     """Metadata-only diagnostics; no transcript hashing or credential reads."""
     checks = []
@@ -686,6 +766,7 @@ def copy_file_checked(source, destination):
     with source.open("rb") as reader, destination.open("xb") as writer:
         while True:
             chunk = reader.read(CHUNK_SIZE)
+            progress_heartbeat()
             if not chunk:
                 break
             hasher.update(chunk)
@@ -725,6 +806,7 @@ def copy_cache_rows(source, destination, thread_id, source_database="main", norm
         for row in source.execute(
             f"SELECT {names_sql} FROM {quote(source_database)}.{quote(table)} WHERE thread_id=?", (thread_id,)
         ):
+            progress_heartbeat()
             destination.execute(insert, tuple(row))
             count += 1
         counts[table] = count
@@ -732,6 +814,7 @@ def copy_cache_rows(source, destination, thread_id, source_database="main", norm
     return counts
 
 
+@endpoint_progress("reading")
 def export_chat(args):
     home = native_home(args.home)
     sources = scoped_sources(args.scope)
@@ -770,6 +853,7 @@ def export_chat(args):
             if not path.is_file():
                 fail("rollout_missing", "Source rollout is missing")
             cache = sqlite3.connect(package / "history.sqlite")
+            progress_update("exporting")
             try:
                 meta["cache_counts"] = copy_cache_rows(history, cache, row["id"])
                 if cache.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -780,6 +864,7 @@ def export_chat(args):
             projected = revision.get("cache", {}).get("thread_history_projection_state", {}).get("max_next_rollout_byte_offset")
             if projected is not None and projected > meta["transcript"]["size"]:
                 fail("projection_past_eof", "Source cached projection exceeds the copied transcript")
+        progress_update("verifying")
         current = read_revision(home, row["id"], args.quiet_seconds)
         if current is None or current["revision"] != revision["revision"] or current["active"]:
             fail("source_changed", "Source changed during export; discard this package and retry")
@@ -949,6 +1034,7 @@ def transcript_environment_chunks(stream, platform):
     )
     while True:
         initial = stream.readline(CHUNK_SIZE)
+        progress_heartbeat()
         if not initial:
             return
         if initial.endswith(b"\n"):
@@ -960,6 +1046,7 @@ def transcript_environment_chunks(stream, platform):
             yield initial, initial, environment_path_summary()
             while True:
                 chunk = stream.readline(CHUNK_SIZE)
+                progress_heartbeat()
                 if not chunk:
                     fail("incomplete_transcript", "Environment repair requires complete JSONL records")
                 yield chunk, chunk, environment_path_summary()
@@ -972,6 +1059,7 @@ def transcript_environment_chunks(stream, platform):
             if remaining <= 0:
                 fail("environment_record_too_large", "Environment record exceeds the safe JSON decode limit")
             chunk = stream.readline(min(CHUNK_SIZE, remaining))
+            progress_heartbeat()
             if not chunk:
                 fail("incomplete_transcript", "Environment repair requires complete JSONL records")
             record.extend(chunk)
@@ -996,6 +1084,7 @@ def inspect_workspace_environment(path, platform=None):
     return summary
 
 
+@endpoint_progress("previewing")
 def path_preview(args):
     home = native_home(args.home)
     sources = scoped_sources(args.scope)
@@ -1199,6 +1288,7 @@ def check_package(meta, package, metadata_only):
         cache.close()
 
 
+@endpoint_progress("previewing")
 def import_preview(args):
     """Check predictable environment compatibility before a controller journal.
 
@@ -1245,6 +1335,7 @@ def backup_chat(home, target, row, thread_id):
     return folder
 
 
+@endpoint_progress("verifying")
 def import_chat(args):
     home = native_home(args.home)
     sources = scoped_sources(args.scope)
@@ -1317,11 +1408,13 @@ def import_chat(args):
         if not args.metadata_only:
             cache = readonly(package / "history.sqlite")
             validate_cache_schema(target, cache)
+        progress_update("backing_up")
         backup = backup_chat(home, target, existing, thread_id)
         write_json(backup / "journal.json", {"status": "pending", "id": thread_id, "expected": args.expected,
                    "destination": str(destination), "metadata_only": bool(args.metadata_only),
                    "environment_only": environment_only})
         destination.parent.mkdir(parents=True, exist_ok=True)
+        progress_update("writing")
         if args.metadata_only:
             if old_path is not None and old_path != destination:
                 if not old_path.is_file():
@@ -1360,6 +1453,7 @@ def import_chat(args):
                     fields = ",".join(quote(name) for name in names)
                     sql = f"INSERT INTO history.{quote(table)} ({fields}) VALUES ({','.join('?' for _ in names)})"
                     for record in cache.execute(f"SELECT {fields} FROM {quote(table)} WHERE thread_id=?", (thread_id,)):
+                        progress_heartbeat()
                         values = list(record)
                         offset_names = (("rollout_byte_offset", "rollout_end_byte_offset") if table == "thread_turns"
                                         else ("next_rollout_byte_offset",) if table == "thread_history_projection_state" else ())
@@ -1399,6 +1493,7 @@ def import_chat(args):
                            ",".join("?" for _ in keys) + ")", tuple(updates[key] for key in keys))
         # Capture exactly what this transaction writes. Do not checkpoint a
         # newer edit that might happen after commit in another process.
+        progress_update("verifying")
         committed_row = thread_row(target, thread_id)
         current = revision_from_connections(home, committed_row, target, args.quiet_seconds, "history")
         write_json(backup / "journal.json", {"status": "pending", "id": thread_id, "expected": args.expected,
@@ -1406,6 +1501,7 @@ def import_chat(args):
                    "metadata_only": bool(args.metadata_only), "environment_only": environment_only})
         target.commit()
         committed = True
+        progress_update("committed")
         write_json(backup / "journal.json", {"status": "committed", "id": thread_id, "expected": args.expected,
                    "result_revision": current["revision"], "destination": str(destination),
                    "metadata_only": bool(args.metadata_only), "environment_only": environment_only})
@@ -1451,6 +1547,10 @@ def build_parser():
         command.add_argument("--home", required=True)
         command.add_argument("--scope", default="cli,vscode")
         command.add_argument("--quiet-seconds", type=int, default=60)
+        command.add_argument("--progress-file")
+        command.add_argument("--progress-run-id")
+        command.add_argument("--progress-operation-id")
+        command.add_argument("--progress-side", choices=("windows", "wsl"))
         if name in ("export", "import"):
             command.add_argument("--package", required=True)
             command.add_argument("--expected")
@@ -1473,6 +1573,7 @@ def main():
                           "message": "Python 3.11 or newer is required for bounded SQLite item reads."}))
         return 2
     args = build_parser().parse_args()
+    args._progress = configured_progress(args)
     try:
         if args.quiet_seconds < 0:
             fail("quiet_invalid", "Quiet seconds must be nonnegative")
@@ -1481,9 +1582,19 @@ def main():
                      "path-preview": path_preview, "import-preview": import_preview}[args.command]
         result = operation(args)
     except EndpointError as error:
+        if args._progress:
+            try:
+                args._progress.finish("error")
+            except Exception:
+                pass
         print(json.dumps({"ok": False, "code": error.code, "message": str(error)}, ensure_ascii=True))
         return 2
     except (OSError, sqlite3.Error, ValueError, KeyError, TypeError) as error:
+        if args._progress:
+            try:
+                args._progress.finish("error")
+            except Exception:
+                pass
         # Do not echo source content, SQL parameter values, credentials, or
         # arbitrary malformed package data in machine-readable error output.
         print(json.dumps({"ok": False, "code": "endpoint_error", "error_type": type(error).__name__}))

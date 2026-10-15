@@ -20,9 +20,10 @@ import sys
 import tempfile
 import time
 import uuid
+from history_progress import ProgressWriter
 
 VERSION = 1
-SOFTWARE_VERSION = '2.1.1'
+SOFTWARE_VERSION = '2.2.0'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -226,8 +227,26 @@ class Endpoints:
     def __init__(self, config, script_dir):
         self.config = config
         self.script = script_dir / 'history_endpoint.py'
+        self.reporter = None
 
     def call(self, side, operation, *args):
+        progress_args = []
+        reporter = self.reporter
+        if reporter is not None and reporter.enabled:
+            try:
+                phases = {'inspect': 'checking_' + side, 'backend-status': 'checking_backend',
+                          'export': 'exporting', 'import-preview': 'previewing',
+                          'import': 'writing', 'path-preview': 'repairing'}
+                operation_id = reporter.begin_operation(phases.get(operation, 'reading'), side=side)
+                if operation_id:
+                    progress_path = reporter.path.parent / 'progress-detail.json'
+                    progress_args = ['--progress-file', str(progress_path) if side == 'windows' else linux_mount_path(progress_path),
+                                     '--progress-run-id', reporter.run_id,
+                                     '--progress-operation-id', operation_id, '--progress-side', side]
+            except Exception:
+                # Path conversion or diagnostic failures must never add a new
+                # failure condition to the synchronization protocol.
+                progress_args = []
         if side == 'windows':
             cmd = [self.config['python_windows'], str(self.script), operation, '--home', self.config['windows_home']]
         else:
@@ -235,7 +254,7 @@ class Endpoints:
             if not wsl_running(self.config['wsl_distro']):
                 raise RuntimeError('WSL stopped during this run; deferred until the next run')
             cmd = ['wsl.exe', '--distribution', self.config['wsl_distro'], '--user', self.config['wsl_user'], '--exec', self.config.get('python_wsl', '/usr/bin/python3'), linux_mount_path(self.script), operation, '--home', self.config['wsl_home']]
-        cmd += ['--quiet-seconds', str(self.config.get('quiet_seconds', 60)), *map(str, args)]
+        cmd += ['--quiet-seconds', str(self.config.get('quiet_seconds', 60)), *map(str, args), *progress_args]
         result = subprocess.run(cmd, capture_output=True, timeout=self.config.get('operation_timeout_seconds', 120),
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         try:
@@ -385,7 +404,45 @@ def run_lock(path):
             msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def execute(config, args, runtime, log, progress=None):
+def _tracked_operation(function, kind):
+    def run(config, args, runtime, log, progress=None):
+        # The caller owns run.lock. Dry-run and initialization preserve their
+        # existing telemetry-free semantics, including no progress-file writes.
+        reporter = None
+        if not args.dry_run and not getattr(args, 'initialize', False):
+            reporter = getattr(args, 'progress_writer', None)
+            if not isinstance(reporter, ProgressWriter):
+                reporter = ProgressWriter(runtime / 'progress.json', kind=kind,
+                    run_id=getattr(args, 'progress_run_id', None), request_id=getattr(args, 'progress_request_id', None))
+        if reporter is not None:
+            reporter.update('starting', processed_chats=0, transferred_chats=0, deferred_chats=0)
+        try:
+            result = function(config, args, runtime, log, progress, reporter=reporter)
+            if reporter is not None:
+                transferred = result.get('transferred', result.get('repaired', 0))
+                deferred = len(result.get('deferred', []))
+                remaining = result.get('remaining_transfers', 0)
+                blocked = len(result.get('blocked', []))
+                unavailable = any(result.get('endpoint_skipped', {}).values())
+                waiting = (result.get('status') == 'skipped_wsl_stopped' or remaining or blocked
+                           or unavailable or result.get('batch_stop_reason'))
+                fields = {'processed_chats': result.get('inspected_repairs', transferred + deferred),
+                          'transferred_chats': transferred,
+                          'deferred_chats': remaining + blocked}
+                if result.get('status') == 'skipped_wsl_stopped':
+                    fields['reason'] = 'wsl_stopped'
+                elif waiting:
+                    fields['reason'] = result.get('batch_stop_reason') or 'deferred'
+                reporter.finish('waiting' if waiting else 'completed', **fields)
+            return result
+        except BaseException:
+            if reporter is not None:
+                reporter.finish('error', reason='task_failed')
+            raise
+    return run
+
+
+def _execute(config, args, runtime, log, progress=None, reporter=None):
     started = time.monotonic()
     maximum = config.get('max_transfers_per_run', DEFAULT_MAX_TRANSFERS)
     budget = config.get('run_budget_seconds', DEFAULT_RUN_BUDGET)
@@ -401,7 +458,13 @@ def execute(config, args, runtime, log, progress=None):
             raise RuntimeError('Start the specified WSL distribution before initializing')
         return finish({'status': 'skipped_wsl_stopped'})
     endpoint = Endpoints(config, SCRIPT_DIR)
-    windows, wsl = endpoint.inspect('windows'), endpoint.inspect('wsl')
+    endpoint.reporter = reporter
+    if reporter is not None:
+        reporter.update('checking_windows')
+    windows = endpoint.inspect('windows')
+    if reporter is not None:
+        reporter.update('checking_wsl')
+    wsl = endpoint.inspect('wsl')
     states = {'windows': records(windows), 'wsl': records(wsl)}
     ledger_path = runtime / 'ledger.json'
     if args.initialize:
@@ -416,10 +479,15 @@ def execute(config, args, runtime, log, progress=None):
     ledger = json.loads(ledger_path.read_text(encoding='utf-8')) if initialized else baseline(windows, wsl)
     if isinstance(ledger.get('version'), bool) or ledger.get('version') != VERSION or not isinstance(ledger.get('threads'), dict):
         raise RuntimeError('Unsupported synchronization ledger version')
+    if reporter is not None:
+        reporter.update('planning')
     plan = build_plan(windows, wsl, ledger, config.get('quiet_seconds', 60),
                       config.get('conflict_resolution', 'manual'))
     choice_store, choice_updates = add_manual_choices(plan, {'windows': windows, 'wsl': wsl}, runtime,
                                                      config.get('quiet_seconds', 60))
+    if reporter is not None:
+        reporter.update('planning', total_chats=len(plan['actions']),
+                        deferred_chats=len(plan['blocked']))
     summary = progress if progress is not None else {}
     summary.update({'status': 'dry_run' if args.dry_run else 'completed', 'initialization_required': not initialized,
                'planned_transfers': len(plan['actions']), 'blocked': plan['blocked'], 'transferred': 0,
@@ -462,6 +530,11 @@ def execute(config, args, runtime, log, progress=None):
             summary['batch_stop_reason'] = 'time_budget'
             break
         summary['attempted_transfers'] += 1
+        if reporter is not None:
+            reporter.update('exporting', current_index=summary['attempted_transfers'],
+                            processed_chats=summary['transferred'] + len(summary['deferred']),
+                            transferred_chats=summary['transferred'],
+                            deferred_chats=len(plan['blocked']) + len(summary['deferred']), side=action['source'])
         with tempfile.TemporaryDirectory(prefix='transfer-', dir=runtime) as package:
             manual_choice = None
             if action.get('conflict_resolution') == 'manual_keep':
@@ -545,6 +618,8 @@ def execute(config, args, runtime, log, progress=None):
             source_record = states[action['source']][action['id']]
             rows = {action['source']: source_record, action['target']: target_record}
             previous = ledger['threads'].get(action['id'], {})
+            if reporter is not None:
+                reporter.update('checkpointing', side=action['target'])
             ledger['threads'][action['id']] = {**rows, 'body_diverged': previous.get('body_diverged', False) if action['mode'] == 'metadata' else False}
             atomic_json(ledger_path, ledger)
             if manual_choice is not None:
@@ -567,6 +642,9 @@ def execute(config, args, runtime, log, progress=None):
             summary['remaining_transfers'] = summary['planned_transfers'] - summary['transferred']
             journal.unlink()
             log.info('Synchronized %s to %s (%s)', action['id'], action['target'], action['mode'])
+            if reporter is not None:
+                reporter.update('checkpointing', processed_chats=summary['transferred'] + len(summary['deferred']),
+                                transferred_chats=summary['transferred'])
     summary['remaining_transfers'] = summary['planned_transfers'] - summary['transferred']
     # Refresh even an empty report: resolved problems must not stay on screen.
     atomic_json(runtime / 'attention.json', {'updated_at': utc_now(), 'blocked': plan['blocked'],
@@ -574,7 +652,7 @@ def execute(config, args, runtime, log, progress=None):
     return finish(summary)
 
 
-def repair_environment_paths(config, args, runtime, log, progress=None):
+def _repair_environment_paths(config, args, runtime, log, progress=None, reporter=None):
     """Repair native environment metadata without copying the other replica.
 
     Use the normal export/import receipts, backup and stopped-backend checks.
@@ -594,21 +672,30 @@ def repair_environment_paths(config, args, runtime, log, progress=None):
     if journal.exists():
         raise RuntimeError('An unfinished prior import exists; review runtime/pending.json before continuing')
     endpoint = Endpoints(config, SCRIPT_DIR)
+    endpoint.reporter = reporter
+    if reporter is not None:
+        reporter.update('checking_' + side, side=side)
     view = endpoint.inspect(side)
     native_records = records(view)
     selected = sorted(set(args.thread_ids or [tid for tid, pair in ledger['threads'].items()
                                              if pair.get(side) is not None]))
+    if reporter is not None:
+        reporter.update('repairing', total_chats=len(selected))
     summary = progress if progress is not None else {}
     summary.update({'status': 'path_repair_preview' if args.dry_run else 'path_repair_completed',
                     'repair_side': side, 'planned_repairs': 0, 'repaired': 0,
-                    'unchanged': 0, 'blocked': [], 'repairs': []})
+                    'unchanged': 0, 'blocked': [], 'repairs': [], 'inspected_repairs': 0})
     maximum = config.get('max_transfers_per_run', DEFAULT_MAX_TRANSFERS)
     budget = config.get('run_budget_seconds', DEFAULT_RUN_BUDGET)
     ledger_backup = None
-    for tid in selected:
+    for index, tid in enumerate(selected, 1):
+        if reporter is not None:
+            reporter.update('repairing', current_index=index, processed_chats=index - 1,
+                            transferred_chats=summary['repaired'], deferred_chats=len(summary['blocked']))
         if time.monotonic() - started >= budget:
             summary['batch_stop_reason'] = 'time_budget'
             break
+        summary['inspected_repairs'] += 1
         pair = ledger['threads'].get(tid)
         row = native_records.get(tid)
         if not pair or not isinstance(pair.get(side), dict) or row is None:
@@ -673,6 +760,10 @@ def repair_environment_paths(config, args, runtime, log, progress=None):
             log.info('Repaired native environment paths for %s on %s', tid, side)
     summary['elapsed_seconds'] = round(time.monotonic() - started, 3)
     return summary
+
+
+execute = _tracked_operation(_execute, 'sync')
+repair_environment_paths = _tracked_operation(_repair_environment_paths, 'repair')
 
 
 def utc_now():
