@@ -105,7 +105,9 @@ class MergeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="history-merge-test-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Native Windows temporary paths can use an 8.3 user-name alias while
+        # Package resolves to its long spelling. Use the same native identity.
+        self.root = Path(self.temp.name).resolve()
         common = [("turn-common", "Shared question")]
         self.windows = package(self.root / "windows", common + [("turn-windows", "Windows addition")])
         self.wsl = package(self.root / "wsl", common + [("turn-wsl", "Matplotlib learning")], "linux", True)
@@ -359,7 +361,7 @@ class MergeTests(unittest.TestCase):
         def copy_then_change(source, target, *args, **kwargs):
             nonlocal changed
             result = original_copy(source, target, *args, **kwargs)
-            if not changed and Path(source) == self.windows / "meta.json":
+            if not changed and Path(source).resolve() == (self.windows / "meta.json").resolve():
                 changed = True
                 with Path(source).open("ab") as stream:
                     stream.write(b" ")
@@ -368,6 +370,7 @@ class MergeTests(unittest.TestCase):
             with self.assertRaises(merge.MergeError) as error:
                 self.run_merge()
         self.assertEqual(error.exception.code, "source_changed")
+        self.assertTrue(changed, "The source-change injection must actually run")
         self.assertFalse(self.output.exists())
         self.assertEqual(list(self.root.glob(".history-merge-*")), [])
 
