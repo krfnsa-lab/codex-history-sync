@@ -16,6 +16,22 @@ let configurePending = false;
 const section = 'codexHistoryLiveSync';
 const gatewayName = 'codex-history-sync-bridge';
 
+// VS Code resolves a notification promise only after dismissal or an action.
+// Ordinary notices must never own a synchronization/setup operation's lifetime.
+function notify(method, message) {
+  try { void Promise.resolve(vscode.window[method](message)).catch(() => {}); }
+  catch { /* A failed notice must not retain a synchronization guard. */ }
+}
+
+function reportCheck(feedback) {
+  if (!feedback) return;
+  if (!feedback.conflicts) { notify(feedback.method, feedback.message); return; }
+  try {
+    void Promise.resolve(vscode.window.showWarningMessage(feedback.message, '处理聊天冲突'))
+      .then(choice => choice === '处理聊天冲突' ? mergeChats() : undefined).catch(() => {});
+  } catch { /* Check cleanup has already finished; keep later checks available. */ }
+}
+
 function bootstrapGateway(context) {
   const official = vscode.extensions.getExtension('openai.chatgpt');
   if (!official || !['win32', 'linux'].includes(process.platform) || process.arch !== 'x64') return false;
@@ -32,17 +48,17 @@ function bootstrapGateway(context) {
 
 async function configureGateway(context, quiet = false) {
   if (!quiet && (mergeInProgress || checkInProgress || recoveryInProgress || setupInProgress)) {
-    await vscode.window.showWarningMessage('同步、冲突处理或设置正在进行，请等待本轮结束。'); return false;
+    notify('showWarningMessage', '同步、冲突处理或设置正在进行，请等待本轮结束。'); return false;
   }
   const config = vscode.workspace.getConfiguration('chatgpt');
   if (process.platform === 'win32' && config.get('runCodexInWindowsSubsystemForLinux') === true) {
-    await vscode.window.showWarningMessage('本预览只支持通过 Remote WSL 打开的窗口。请先关闭在 Windows 本地窗口中让 Codex 单独运行于 WSL 的选项。'); return false;
+    notify('showWarningMessage', '本预览只支持通过 Remote WSL 打开的窗口。请先关闭在 Windows 本地窗口中让 Codex 单独运行于 WSL 的选项。'); return false;
   }
   const ready = bootstrapGateway(context);
-  if (!ready) { await vscode.window.showWarningMessage('同步桥尚未完整安装；请先按安装说明准备两端启动器。'); return false; }
+  if (!ready) { notify('showWarningMessage', '同步桥尚未完整安装；请先按安装说明准备两端启动器。'); return false; }
   const current = config.get('cliExecutable');
   if (current != null && String(current).trim() !== '' && current !== gatewayName) {
-    await vscode.window.showWarningMessage('已配置自定义 Codex，请先自行恢复默认设置；同步桥不会覆盖它。'); return false;
+    notify('showWarningMessage', '已配置自定义 Codex，请先自行恢复默认设置；同步桥不会覆盖它。'); return false;
   }
   const previous = context.globalState.get('gatewayOriginalSetting');
   if (current !== gatewayName && previous === undefined) {
@@ -50,14 +66,14 @@ async function configureGateway(context, quiet = false) {
     await context.globalState.update('gatewayOriginalSetting', { hadValue: inspected?.globalValue !== undefined, value: inspected?.globalValue ?? null });
   }
   await config.update('cliExecutable', gatewayName, vscode.ConfigurationTarget.Global);
-  if (!quiet) await vscode.window.showInformationMessage('同步桥已配置。请先确认 Windows 和 WSL 两端都已安装，再重载此窗口。');
+  if (!quiet) notify('showInformationMessage', '同步桥已配置。请先确认 Windows 和 WSL 两端都已安装，再重载此窗口。');
   return true;
 }
 
 async function setup(context) {
-  if (!isWsl()) { await vscode.window.showWarningMessage('请在通过 Remote WSL 连接的 VS Code 窗口中完成设置。'); return; }
-  if (mergeInProgress || checkInProgress || coordinator?.running || setupInProgress) { await vscode.window.showWarningMessage('同步、冲突处理或设置正在进行，请稍后再完成设置。'); return; }
-  if (context.globalState.get('needsReview')) { await vscode.window.showWarningMessage('同步需要检查。请先处理未完成的导入和暂停保护，再重新设置。'); return; }
+  if (!isWsl()) { notify('showWarningMessage', '请在通过 Remote WSL 连接的 VS Code 窗口中完成设置。'); return; }
+  if (mergeInProgress || checkInProgress || coordinator?.running || setupInProgress) { notify('showWarningMessage', '同步、冲突处理或设置正在进行，请稍后再完成设置。'); return; }
+  if (context.globalState.get('needsReview')) { notify('showWarningMessage', '同步需要检查。请先处理未完成的导入和暂停保护，再重新设置。'); return; }
   let reloadRequested = false;
   try {
     const file = path.join(os.homedir(), '.config', 'codex-history-sync-live', 'launcher.json');
@@ -94,7 +110,7 @@ async function setup(context) {
     await config.update('enabled', true, vscode.ConfigurationTarget.Global);
     reloadRequested = true;
     await vscode.commands.executeCommand('workbench.action.reloadWindow');
-  } catch (error) { await vscode.window.showWarningMessage(error.message); }
+  } catch (error) { notify('showWarningMessage', error.message); }
   finally { setupInProgress = false; if (!reloadRequested) configure(); }
 }
 
@@ -103,18 +119,18 @@ async function disableRestore(context) {
   await disable();
   const currentSettings = settings();
   if (wasRunning || (isWsl() && currentSettings.stateDir && fs.existsSync(path.join(currentSettings.stateDir, 'pause.json')))) {
-    await vscode.window.showWarningMessage('自动同步已停用。仍有同步或暂停保护，请先通过恢复工具检查；当前不会恢复原 Codex 启动设置。'); return;
+    notify('showWarningMessage', '自动同步已停用。仍有同步或暂停保护，请先通过恢复工具检查；当前不会恢复原 Codex 启动设置。'); return;
   }
   if (context.globalState.get('needsReview') && isWsl()) {
     try {
       validateConfig(currentSettings);
       if ((await runWindows(currentSettings, 'recovery')).safe_to_reload !== true) throw new Error('仍有未完成的导入，请先完成恢复检查。');
-    } catch (error) { await vscode.window.showWarningMessage(error.message); return; }
+    } catch (error) { notify('showWarningMessage', error.message); return; }
   }
   const config = vscode.workspace.getConfiguration('chatgpt');
   if (config.get('cliExecutable') === gatewayName) {
     const previous = context.globalState.get('gatewayOriginalSetting');
-    if (!previous) { await vscode.window.showWarningMessage('缺少原设置备份；已停用自动同步，请在设置中清空 Codex 自定义可执行文件。'); return; }
+    if (!previous) { notify('showWarningMessage', '缺少原设置备份；已停用自动同步，请在设置中清空 Codex 自定义可执行文件。'); return; }
     await config.update('cliExecutable', previous.hadValue ? previous.value : undefined, vscode.ConfigurationTarget.Global);
     await context.globalState.update('gatewayOriginalSetting', undefined);
   }
@@ -130,7 +146,7 @@ async function disableRestore(context) {
     await context.globalState.update('setupInstalledSettings', undefined);
   }
   await context.globalState.update('nextAttemptAt', 0);
-  await vscode.window.showInformationMessage('自动同步已停用，原 Codex 设置已恢复。重载窗口后生效。');
+  notify('showInformationMessage', '自动同步已停用，原 Codex 设置已恢复。重载窗口后生效。');
 }
 
 function settings() {
@@ -178,15 +194,15 @@ function mergeWaitingMessage(result) {
 }
 
 async function mergeChats() {
-  if (!isWsl()) { await vscode.window.showWarningMessage('请在连接 WSL 的 VS Code 窗口中选择聊天版本。'); return; }
+  if (!isWsl()) { notify('showWarningMessage', '请在连接 WSL 的 VS Code 窗口中选择聊天版本。'); return; }
   if (mergeInProgress || checkInProgress || recoveryInProgress || coordinator?.running || setupInProgress) {
-    await vscode.window.showInformationMessage('同步、恢复或冲突处理正在进行，请等待本轮结束。'); return;
+    notify('showInformationMessage', '同步、恢复或冲突处理正在进行，请等待本轮结束。'); return;
   }
   const config = settings();
   try { validateConfig(config); }
-  catch { await vscode.window.showWarningMessage('同步桥配置不完整，请先完成设置再处理聊天冲突。'); return; }
+  catch { notify('showWarningMessage', '同步桥配置不完整，请先完成设置再处理聊天冲突。'); return; }
   if (fs.existsSync(path.join(config.stateDir, 'pause.json'))) {
-    await vscode.window.showWarningMessage('已有暂停保护，请先完成同步恢复检查，再选择聊天版本。'); return;
+    notify('showWarningMessage', '已有暂停保护，请先完成同步恢复检查，再选择聊天版本。'); return;
   }
   mergeInProgress = true;
   const generation = configurationGeneration;
@@ -196,7 +212,7 @@ async function mergeChats() {
     const listing = await runMergeWindows(config, { type: 'list' });
     if (!current()) return;
     if (listing.ok !== true || listing.status !== 'candidates' || !Array.isArray(listing.chats)) {
-      await vscode.window.showWarningMessage(mergeWaitingMessage(listing)); return;
+      notify('showWarningMessage', mergeWaitingMessage(listing)); return;
     }
     const choices = listing.chats.filter(chat => chat.ready === true && typeof chat.id === 'string' &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(chat.id) &&
@@ -206,7 +222,7 @@ async function mergeChats() {
         description: `Windows ${chat.windows_turns} 轮 · WSL ${chat.wsl_turns} 轮`, id: chat.id,
         choiceToken: chat.choice_token, windowsTurns: chat.windows_turns, wslTurns: chat.wsl_turns }));
     if (!choices.length) {
-      await vscode.window.showInformationMessage(listing.chats.length ? '冲突聊天尚未空闲或无法可靠比较。请静置两端这条聊天至少 60 秒后重新检查。' : '没有待处理的聊天冲突。'); return;
+      notify('showInformationMessage', listing.chats.length ? '冲突聊天尚未空闲或无法可靠比较。请静置两端这条聊天至少 60 秒后重新检查。' : '没有待处理的聊天冲突。'); return;
     }
     const chosen = await vscode.window.showQuickPick(choices, { title: '选择有冲突的聊天', placeHolder: '手动决定保留 Windows 还是 WSL 的版本', canPickMany: false });
     if (!chosen) return;
@@ -225,10 +241,10 @@ async function mergeChats() {
       () => runMergeWindows(config, action));
     if (result.ok === true && result.status === 'choice_saved' && result.reason === 'waiting_for_safe_sync' &&
         result.id === chosen.id && result.keep_side === method.keepSide) {
-      await vscode.window.showInformationMessage(`已保存以 ${source} 为准的选择，尚未同步。等待 ${target} Codex 后端停止、两端聊天保持空闲后，定时任务会更新对端；若版本发生变化，需重新确认。不会创建聊天副本。`);
-    } else await vscode.window.showWarningMessage(mergeWaitingMessage(result));
+      notify('showInformationMessage', `已保存以 ${source} 为准的选择，尚未同步。等待 ${target} Codex 后端停止、两端聊天保持空闲后，定时任务会更新对端；若版本发生变化，需重新确认。不会创建聊天副本。`);
+    } else notify('showWarningMessage', mergeWaitingMessage(result));
   } catch {
-    await vscode.window.showWarningMessage('冲突处理未完成。请检查恢复记录或重新安装冲突处理工具后重试。');
+    notify('showWarningMessage', '冲突处理未完成。请检查恢复记录或重新安装冲突处理工具后重试。');
   } finally {
     mergeInProgress = false;
     if (configurePending) { configurePending = false; configure(false); }
@@ -237,20 +253,20 @@ async function mergeChats() {
 
 async function check(manual = false) {
   if (mergeInProgress || checkInProgress) {
-    if (manual) await vscode.window.showInformationMessage('已有同步检查正在进行，请等待本轮结束。');
+    if (manual) notify('showInformationMessage', '已有同步检查正在进行，请等待本轮结束。');
     return;
   }
   if (!coordinator) {
-    if (manual) await vscode.window.showWarningMessage('同步尚未启用或配置不完整，请先检查同步桥设置。');
+    if (manual) notify('showWarningMessage', '同步尚未启用或配置不完整，请先检查同步桥设置。');
     return;
   }
   checkInProgress = true;
-  let mergeRequested = false;
+  let feedback;
   try {
     if (extensionContext.globalState.get('needsReview')) {
       if (!manual && extensionContext.globalState.get('reviewRecoverySuppressed')) return;
       if (recoveryInProgress) {
-        if (manual) await vscode.window.showInformationMessage('恢复检查正在进行，请等待本轮结束。');
+        if (manual) notify('showInformationMessage', '恢复检查正在进行，请等待本轮结束。');
         return;
       }
       recoveryInProgress = true;
@@ -277,13 +293,13 @@ async function check(manual = false) {
           }
           status.text = '$(history) Codex：已恢复自动同步';
           status.tooltip = '恢复检查已通过，后续检查会继续同步；本次恢复检查未传输记录。';
-          if (manual) await vscode.window.showInformationMessage(status.tooltip);
+          if (manual) feedback = { method: 'showInformationMessage', message: status.tooltip };
           return;
         }
         const presentation = describeResult(recovered);
         status.text = '$(warning) Codex：同步需要检查';
         status.tooltip = '自动同步仍暂停。' + presentation.detail;
-        if (manual) await vscode.window.showWarningMessage(status.tooltip);
+        if (manual) feedback = { method: 'showWarningMessage', message: status.tooltip };
         return;
       } finally {
         recoveryInProgress = false;
@@ -296,21 +312,20 @@ async function check(manual = false) {
     status.tooltip = presentation.detail; lastError = '';
     if (manual) {
       const hasConflicts = ['chat_conflict', 'manual_choice_stale'].includes(result.reason) || (Number.isInteger(result.preview?.conflict_count) && result.preview.conflict_count > 0);
-      if (hasConflicts) mergeRequested = await vscode.window.showWarningMessage(presentation.detail, '处理聊天冲突') === '处理聊天冲突';
-      else if (presentation.warning) await vscode.window.showWarningMessage(presentation.detail);
-      else await vscode.window.showInformationMessage(presentation.detail);
+      feedback = { method: presentation.warning ? 'showWarningMessage' : 'showInformationMessage',
+        message: presentation.detail, conflicts: hasConflicts };
     }
   } catch (error) {
     const message = failureMessage(error);
     status.text = '$(warning) Codex：同步待处理';
     status.tooltip = message;
-    if (manual && lastError !== message) await vscode.window.showWarningMessage(message);
+    if (manual && lastError !== message) feedback = { method: 'showWarningMessage', message };
     lastError = message;
   } finally {
     checkInProgress = false;
     if (configurePending) { configurePending = false; configure(false); }
+    reportCheck(feedback);
   }
-  if (mergeRequested) await mergeChats();
 }
 
 function configure(initialCheck = true) {
@@ -377,12 +392,12 @@ function activate(context) {
     vscode.commands.registerCommand('codexHistoryLiveSync.configureGateway', () => configureGateway(context)),
     vscode.commands.registerCommand('codexHistoryLiveSync.disableRestore', () => disableRestore(context)),
     vscode.commands.registerCommand('codexHistoryLiveSync.enable', async () => {
-      if (mergeInProgress || setupInProgress) { await vscode.window.showWarningMessage('冲突处理或设置正在进行，请等待本轮结束。'); return; }
-      if (!isWsl()) { await vscode.window.showWarningMessage('请在连接 WSL 的 VS Code 窗口中启用。'); return; }
+      if (mergeInProgress || setupInProgress) { notify('showWarningMessage', '冲突处理或设置正在进行，请等待本轮结束。'); return; }
+      if (!isWsl()) { notify('showWarningMessage', '请在连接 WSL 的 VS Code 窗口中启用。'); return; }
       try { validateConfig(settings()); }
-      catch (error) { await vscode.window.showWarningMessage(error.message); return; }
+      catch (error) { notify('showWarningMessage', error.message); return; }
       if (context.globalState.get('needsReview')) { await check(true); return; }
-      if (vscode.workspace.getConfiguration('chatgpt').get('cliExecutable') !== gatewayName) { await vscode.window.showWarningMessage('请先配置同步桥，再启用自动同步。'); return; }
+      if (vscode.workspace.getConfiguration('chatgpt').get('cliExecutable') !== gatewayName) { notify('showWarningMessage', '请先配置同步桥，再启用自动同步。'); return; }
       await context.globalState.update('reviewRecoverySuppressed', false);
       await vscode.workspace.getConfiguration(section).update('enabled', true, vscode.ConfigurationTarget.Global);
     }),

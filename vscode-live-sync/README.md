@@ -1,6 +1,6 @@
-# Codex History Sync 1.0.0
+# Codex History Sync 1.0.1
 
-在 VS Code 的 Remote WSL 窗口检查 Windows 聊天更新，提供手动应用及冲突选端入口。基础同步脚本版本为 2.1.0。
+在 VS Code 的 Remote WSL 窗口检查 Windows 聊天更新，提供手动应用及冲突选端入口。基础同步脚本版本为 2.1.1。
 
 ## 日常使用
 

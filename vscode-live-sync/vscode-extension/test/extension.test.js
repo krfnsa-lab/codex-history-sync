@@ -62,6 +62,97 @@ function load({ platform = 'linux', overrides = {}, pause = false, accept = true
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+function leaveNoticesOpen(f) {
+  const pending = new Promise(() => {});
+  for (const method of ['showInformationMessage', 'showWarningMessage']) {
+    const original = f.vscode.window[method];
+    f.vscode.window[method] = (...args) => {
+      const result = original(...args);
+      return args[1]?.modal ? result : pending;
+    };
+  }
+}
+
+async function finishesWithoutDismissal(operation) {
+  let finished = false;
+  const result = operation();
+  result.then(() => { finished = true; });
+  await settle();
+  assert.equal(finished, true, 'Completed work must not wait for a result notification to close');
+  await result;
+}
+
+test('open information and warning notices do not retain check guards or defer configuration', async () => {
+  for (const result of [{ kind: 'current', reason: 'no_pending_updates' }, { kind: 'blocked', reason: 'incoming_update_blocked' }]) {
+    const f = load({ review: true, recoveryResults: [{ kind: 'recovered' }], checkResults: [result, result] });
+    await settle(); leaveNoticesOpen(f);
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    const constructors = f.constructors;
+    f.notifyConfiguration(); await settle();
+    assert.equal(f.constructors, constructors + 1);
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    assert.ok(f.calls.filter(call => call[0] === 'check').length >= 2);
+    assert.ok(!f.calls.some(call => call[0] === 'info' && call[1].includes('已有同步检查')));
+  }
+});
+
+test('open recovery result notices release recovery and check guards', async () => {
+  for (const outcome of [{ kind: 'recovered' }, { kind: 'waiting', reason: 'codex_busy' }]) {
+    const f = load({ review: true }); await settle(); leaveNoticesOpen(f);
+    f.recoveryResults.push(outcome);
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+    assert.ok(!f.calls.some(call => call[0] === 'info' && call[1].includes('已有同步检查')));
+  }
+});
+
+test('an unclosed conflict action notice does not block checks and its later action uses a fresh list', async () => {
+  const f = load({ review: true, recoveryResults: [{ kind: 'recovered' }],
+    checkResults: [{ kind: 'conflict', reason: 'chat_conflict' }, { kind: 'current', reason: 'no_pending_updates' }],
+    mergeResults: [candidateListing, savedChoice('windows')] });
+  await settle();
+  let choose;
+  const pending = new Promise(resolve => { choose = resolve; });
+  const original = f.vscode.window.showWarningMessage;
+  f.vscode.window.showWarningMessage = (...args) => {
+    const result = original(...args);
+    return args[1] === '处理聊天冲突' ? pending : result;
+  };
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+  assert.equal(f.calls.filter(call => call[0] === 'check').length, 2);
+  assert.equal(f.calls.filter(call => call[0] === 'merge').length, 0);
+  choose('处理聊天冲突'); await settle();
+  assert.equal(f.calls.filter(call => call[0] === 'merge').length, 2);
+});
+
+test('an open saved-choice notice does not keep conflict handling busy', async () => {
+  const f = load({ configured: true, mergeResults: [candidateListing, savedChoice('windows')] });
+  leaveNoticesOpen(f);
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.resolveConflicts')());
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.resolveConflicts')());
+  assert.equal(f.calls.filter(call => call[0] === 'merge').length, 3);
+  assert.ok(!f.calls.some(call => call[0] === 'info' && call[1].includes('正在进行，请等待')));
+});
+
+test('an open gateway setup error notice does not keep setup busy', async () => {
+  const f = load();
+  leaveNoticesOpen(f);
+  f.vscode.extensions.getExtension = () => undefined;
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.setup')());
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.setup')());
+  assert.equal(f.calls.filter(call => call[0] === 'read-installation').length, 2);
+  assert.ok(!f.calls.some(call => call[0] === 'warning' && call[1].includes('正在进行，请稍后')));
+});
+
+test('notification promise rejections do not retain operation guards', async () => {
+  const f = load({ review: true, recoveryResults: [{ kind: 'recovered' }] }); await settle();
+  f.vscode.window.showInformationMessage = () => Promise.reject(new Error('Notification service unavailable'));
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+  await finishesWithoutDismissal(() => f.commands.get('codexHistoryLiveSync.checkNow')());
+  assert.equal(f.calls.filter(call => call[0] === 'check').length, 2);
+});
+
 test('a reviewed installation automatically retries recovery and resumes without importing or reloading', async () => {
   const f = load({ review: true, recoveryResults: [{ kind: 'recovered', reason: 'recovery_verified' }] });
   await settle();
@@ -347,6 +438,7 @@ test('manual status check offers conflict handling and enters selection UI after
     mergeResults: [candidateListing, savedChoice('windows')]
   }); await settle();
   await f.commands.get('codexHistoryLiveSync.checkNow')();
+  await settle(); // The action toast opens conflict handling after check cleanup.
   assert.ok(f.calls.some(call => call[0] === 'warning' && call[2] === '处理聊天冲突'));
   assert.equal(f.calls.filter(call => call[0] === 'merge').length, 2);
   assert.equal(f.calls.filter(call => call[0] === 'pick').length, 2);

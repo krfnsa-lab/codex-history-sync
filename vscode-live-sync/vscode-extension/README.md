@@ -1,6 +1,6 @@
-# Codex History Sync 1.0.0
+# Codex History Sync 1.0.1
 
-Optional Remote WSL companion for Codex History Sync 2.1.0. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+Optional Remote WSL companion for Codex History Sync 2.1.1. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
 
 The default reloadMode=confirm only previews in the background. A ready update is applied after the user clicks the status and confirms that unsent drafts are saved. Automatic reload is opt-in and requires acceptance through VS Code APIs. The official Codex composer exposes no draft-inspection API; the companion does not promise draft preservation in automatic mode.
 
