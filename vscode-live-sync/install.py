@@ -7,11 +7,45 @@ import shutil
 import subprocess
 import sys
 import struct
+import uuid
+import zipfile
 from build_vsix import package
 from preview_sync import load_controller
 
 ROOT = Path(__file__).resolve().parent
 OWNER = 'krfnsa-lab.codex-history-live-sync'
+
+
+def equivalent_launcher(source, target):
+    """Ignore ZIP timestamps when the native launcher and script are identical."""
+    if not target.is_file() or target.is_symlink():
+        return False
+    try:
+        with zipfile.ZipFile(source) as a, zipfile.ZipFile(target) as b:
+            if a.namelist() != b.namelist() or not a.namelist():
+                return False
+            offset_a = min(i.header_offset for i in a.infolist())
+            offset_b = min(i.header_offset for i in b.infolist())
+            with source.open('rb') as x, target.open('rb') as y:
+                if x.read(offset_a) != y.read(offset_b):
+                    return False
+            return all(a.read(n) == b.read(n) for n in a.namelist())
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return False
+
+
+def atomic_copy(source, target, launcher=False):
+    if target.is_symlink():
+        raise RuntimeError('Installation target must not be a symbolic link')
+    if launcher and equivalent_launcher(source, target):
+        return
+    temporary = target.with_name(target.name + '.install-' + uuid.uuid4().hex)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 def owned_manifest(path):
     try:
@@ -78,14 +112,18 @@ def install(config_path, dry_run=False, controller_path=None):
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return
     destination.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
-    shutil.copy2(ROOT / 'native_local_probe.py', destination / 'native_local_probe.py')
-    shutil.copy2(ROOT / 'native_backend_probe.py', destination / 'native_backend_probe.py')
-    vsix = package(ROOT / 'dist/codex-history-live-sync-0.1.5.vsix')
-    shutil.copy2(ROOT / 'vscode-extension/bin/windows/codex-history-sync-bridge.exe', wrapper)
+    atomic_copy(ROOT / 'preview_sync.py', destination / 'preview_sync.py')
+    atomic_copy(ROOT / 'native_local_probe.py', destination / 'native_local_probe.py')
+    atomic_copy(ROOT / 'native_backend_probe.py', destination / 'native_backend_probe.py')
+    for name in ('merge_chat.py', 'history_merge.py', 'merge_validate.py', 'history_endpoint.py'):
+        atomic_copy(ROOT.parent / name, destination / name)
+    version = json.loads((ROOT / 'vscode-extension/package.json').read_text(encoding='utf-8'))['version']
+    vsix = package(ROOT / ('dist/codex-history-live-sync-' + version + '.vsix'))
+    atomic_copy(ROOT / 'vscode-extension/bin/windows/codex-history-sync-bridge.exe', wrapper, launcher=True)
     manifest.write_text(json.dumps({'owner': OWNER, 'binary': max(native)[1]}, indent=2), encoding='utf-8')
     setup = {'windowsPython': mount(python), 'windowsController': str(controller), 'windowsConfig': str(config_path),
-             'previewHelper': str(destination / 'preview_sync.py'), 'intervalSeconds': 60, 'controllerTimeoutSeconds': 600}
+             'previewHelper': str(destination / 'preview_sync.py'), 'mergeHelper': str(destination / 'merge_chat.py'),
+             'intervalSeconds': 60, 'controllerTimeoutSeconds': 600}
     # Native Linux owns Linux configuration and gateway files.
     script = '''import json,os,pathlib,shutil,sys
 p=json.load(sys.stdin)

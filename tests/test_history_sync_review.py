@@ -303,6 +303,35 @@ class PlannerReview(unittest.TestCase):
 
 
 class RunningDistributionReview(unittest.TestCase):
+    def test_native_error_code_is_available_without_parsing_message(self):
+        endpoint = sync.Endpoints({'python_windows': sys.executable,
+                                   'windows_home': 'synthetic-home'}, ROOT)
+        result = SimpleNamespace(returncode=2, stdout=json.dumps({
+            'ok': False, 'code': 'source_changed', 'message': 'Synthetic text',
+        }).encode('utf-8'))
+        with patch.object(sync.subprocess, 'run', return_value=result):
+            with self.assertRaises(sync.EndpointCallError) as captured:
+                endpoint.call('windows', 'export')
+        self.assertEqual((captured.exception.side, captured.exception.operation,
+                          captured.exception.code), ('windows', 'export', 'source_changed'))
+
+    def test_explicit_native_failure_is_not_success_with_zero_exit_code(self):
+        endpoint = sync.Endpoints({'python_windows': sys.executable,
+                                   'windows_home': 'synthetic-home'}, ROOT)
+        result = SimpleNamespace(returncode=0, stdout=b'{"ok":false,"code":"source_active"}')
+        with patch.object(sync.subprocess, 'run', return_value=result):
+            with self.assertRaises(sync.EndpointCallError) as captured:
+                endpoint.call('windows', 'export')
+        self.assertEqual(captured.exception.code, 'source_active')
+
+    def test_nonobject_native_reply_is_rejected(self):
+        endpoint = sync.Endpoints({'python_windows': sys.executable,
+                                   'windows_home': 'synthetic-home'}, ROOT)
+        result = SimpleNamespace(returncode=0, stdout=b'[]')
+        with patch.object(sync.subprocess, 'run', return_value=result):
+            with self.assertRaisesRegex(RuntimeError, 'invalid endpoint response'):
+                endpoint.call('windows', 'export')
+
     def test_utf16_output_and_exact_distribution_match(self):
         from types import SimpleNamespace
         value = '\ufeffUbuntu\r\nUbuntu-Test\r\n'.encode('utf-16-le')
@@ -496,6 +525,65 @@ class CoordinatorCheckpointReview(unittest.TestCase):
         self.assertEqual(self.operations(), ['export', 'import-preview'])
         self.assertEqual(self.saved(), self.before)
         self.assertFalse((self.runtime / 'pending.json').exists())
+
+    def test_transient_source_export_defers_only_that_chat_and_keeps_next_copy(self):
+        for code, reason in (('source_active', 'source_busy'), ('source_changed', 'source_changed'),
+                             ('thread_missing', 'source_disappeared')):
+            with self.subTest(code=code):
+                self.endpoint.call.reset_mock()
+                self.use_new_chats(2)
+                normal_transfer = self.endpoint.call.side_effect
+
+                def resumed_source(side, operation, *args):
+                    if operation == 'export' and args[args.index('--id') + 1] == 'new-00':
+                        # A partially produced package must still be cleaned up.
+                        package = Path(args[args.index('--package') + 1])
+                        (package / 'partial.jsonl').write_bytes(b'partial')
+                        raise sync.EndpointCallError(side, operation, code, 'Synthetic change')
+                    return normal_transfer(side, operation, *args)
+
+                self.endpoint.call.side_effect = resumed_source
+                summary = self.execute()
+                self.assertEqual(summary['status'], 'completed')
+                self.assertEqual(summary['transferred'], 1)
+                self.assertEqual(summary['remaining_transfers'], 1)
+                self.assertEqual(summary['deferred'], [{'id': 'new-00', 'reason': reason}])
+                self.assertNotIn('new-00', self.saved()['threads'])
+                self.assertIn('new-01', self.saved()['threads'])
+                self.assertEqual(self.operations(), ['export', 'export', 'import-preview', 'import'])
+                self.assertFalse((self.runtime / 'pending.json').exists())
+                self.assertFalse(any(self.runtime.glob('transfer-*')))
+
+    def test_unknown_or_untyped_source_export_failure_stops_before_target_write(self):
+        for error in (sync.EndpointCallError('windows', 'export', 'schema_unsupported', 'Synthetic'),
+                      RuntimeError('source_changed'),
+                      sync.EndpointCallError('wsl', 'export', 'source_changed', 'Synthetic'),
+                      sync.EndpointCallError('windows', 'import', 'source_changed', 'Synthetic')):
+            with self.subTest(error=type(error).__name__, code=getattr(error, 'code', None)):
+                self.endpoint.call.reset_mock()
+                self.use_new_chats(2)
+                self.endpoint.call.side_effect = error
+                with self.assertRaises(RuntimeError):
+                    self.execute()
+                self.assertEqual(self.operations(), ['export'])
+                self.assertEqual(self.saved(), self.before)
+                self.assertFalse((self.runtime / 'pending.json').exists())
+
+    def test_source_change_code_from_import_keeps_pending_and_old_checkpoint(self):
+        self.use_new_chats(2)
+        normal_transfer = self.endpoint.call.side_effect
+
+        def failed_import(side, operation, *args):
+            if operation == 'import':
+                raise sync.EndpointCallError(side, operation, 'source_changed', 'Synthetic import failure')
+            return normal_transfer(side, operation, *args)
+
+        self.endpoint.call.side_effect = failed_import
+        with self.assertRaises(sync.EndpointCallError):
+            self.execute()
+        self.assertTrue((self.runtime / 'pending.json').is_file())
+        self.assertEqual(self.saved(), self.before)
+        self.assertEqual(self.operations(), ['export', 'import-preview', 'import'])
 
     def test_resolved_problems_refresh_attention_to_empty_snapshot(self):
         (self.runtime / 'attention.json').write_text(json.dumps({

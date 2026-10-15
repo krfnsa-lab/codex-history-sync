@@ -17,7 +17,7 @@ def package(output):
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
 <Metadata><Identity Language="en-US" Id="{escape(meta['name'])}" Version="{meta['version']}" Publisher="{meta['publisher']}"/>
 <DisplayName>{escape(meta['displayName'])}</DisplayName><Description xml:space="preserve">{escape(meta['description'])}</Description>
-<Tags>codex,wsl</Tags><Categories>Other</Categories><GalleryFlags>Preview</GalleryFlags>
+<Tags>codex,wsl</Tags><Categories>Other</Categories>
 <Properties><Property Id="Microsoft.VisualStudio.Code.Engine" Value="{escape(meta['engines']['vscode'])}"/>
 <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace"/></Properties></Metadata>
 <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation><Dependencies/>
@@ -43,5 +43,6 @@ def package(output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'dist/codex-history-live-sync-0.1.5.vsix')
+    version = json.loads((ROOT / 'vscode-extension/package.json').read_text(encoding='utf-8'))['version']
+    parser.add_argument('--output', type=Path, default=ROOT / ('dist/codex-history-live-sync-' + version + '.vsix'))
     print(package(parser.parse_args().output))

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { Coordinator, validateConfig, runWindows, describeResult } = require('../bridge');
+const { Coordinator, validateConfig, runWindows, runMergeWindows, mergeArguments, describeResult } = require('../bridge');
 
 test('a longer WSL winner explains waiting for the desktop backend without pausing', async t => {
   const f = await fixture(t, { runWindows: async () => ({ eligible: false, reason: 'longer_wsl_pending', conflict_resolution: 'prefer_longer' }) });
@@ -39,6 +39,27 @@ test('busy selected histories report a chosen version while waiting', () => {
   assert.doesNotMatch(display.text, /已同步/);
 });
 
+test('manual conflict success describes the human choice rather than the longer history', () => {
+  const display = describeResult({ kind: 'synced', result: { transferred: 1, resolved_conflicts: 1,
+    conflict_results: [{ reason: 'manual_keep', source: 'wsl', target: 'windows' }] } });
+  assert.match(display.detail, /按你的选择保留版本/);
+  assert.match(display.detail, /被替换的版本已备份/);
+  assert.doesNotMatch(display.detail, /数量|较多/);
+});
+
+test('saved manual choices distinguish waiting from stale confirmation', () => {
+  const waiting = describeResult({ kind: 'waiting', reason: 'opposite_direction_pending', preview: {
+    manual_choices: [{ keep_side: 'wsl', status: 'waiting', reason: 'target_backend_running' }]
+  } });
+  assert.match(waiting.detail, /已手动选择：WSL 1 条/);
+  assert.match(waiting.detail, /尚未同步/);
+  const stale = describeResult({ kind: 'conflict', reason: 'chat_conflict', preview: {
+    manual_choices: [{ keep_side: 'wsl', reason: 'manual_choice_stale' }], blocked_reason_counts: { manual_choice_stale: 1 }
+  } });
+  assert.match(stale.detail, /重新检查并确认/);
+  assert.doesNotMatch(stale.detail, /已手动选择：/);
+});
+
 test('missing Windows helper reports an actionable error without revealing paths', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-missing-helper-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -59,7 +80,7 @@ async function fixture(t, changes = {}) {
     discover: async () => instances,
     request: async (instance, action) => {
       calls.push(action);
-      return action === 'prepare_pause' ? { ok: true, paused: true } : { ok: true, state: { busy: false, idle_seconds: 60, paused: calls.includes('prepare_pause'), child_running: !calls.includes('prepare_pause') } };
+      return action === 'prepare_pause' ? { ok: true, paused: true } : { ok: true, state: { ...healthyRecoveryState, paused: calls.includes('prepare_pause'), child_running: !calls.includes('prepare_pause') } };
     },
     runWindows: async (_, mode) => {
       calls.push(mode === 'recovery' ? 'recovery' : mode ? 'preview' : 'sync');
@@ -153,6 +174,13 @@ test('review recovery exceptions release only the local check flag', async t => 
 test('reject malformed paths before any process starts', () => {
   assert.throws(() => validateConfig({ stateDir: '../relative' }));
   assert.throws(() => validateConfig({ stateDir: '/tmp/state', windowsPython: '/mnt/c/python.exe', windowsController: 'relative.py' }));
+});
+
+test('invalid reload modes and timer values are rejected before any process starts', () => {
+  const config = { stateDir: '/tmp/state', windowsPython: '/mnt/c/python.exe', windowsController: 'C:\\Sync\\history_sync.py', windowsConfig: 'C:\\Sync\\config.json', previewHelper: 'C:\\Sync\\preview.py' };
+  for (const changes of [{ reloadMode: 'sometimes' }, { intervalSeconds: NaN }, { intervalSeconds: 29 }, { intervalSeconds: '60' },
+    { controllerTimeoutSeconds: Infinity }, { controllerTimeoutSeconds: 179 }, { controllerTimeoutSeconds: 180.5 }]) assert.throws(() => validateConfig({ ...config, ...changes }));
+  assert.doesNotThrow(() => validateConfig({ ...config, reloadMode: 'confirm', intervalSeconds: 60, controllerTimeoutSeconds: 600 }));
 });
 
 test('family proof belonging to another native backend cannot pause this window', async t => {
@@ -305,7 +333,7 @@ test('completed sync removes own lease before reload', async t => {
 });
 
 test('new RPC between idle status and pause aborts without interrupting it', async t => {
-  const f = await fixture(t, { request: async (_, action) => action === 'prepare_pause' ? { ok: false, error: 'busy' } : { ok: true, state: { busy: false, idle_seconds: 60 } } });
+  const f = await fixture(t, { request: async (_, action) => action === 'prepare_pause' ? { ok: false, error: 'busy' } : { ok: true, state: { ...healthyRecoveryState } } });
   assert.equal((await f.coordinator.check()).kind, 'waiting');
   assert.deepEqual(f.calls, ['preview']);
   await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
@@ -371,7 +399,7 @@ test('a completed controller does not unlock an active controller run lock', asy
 });
 
 test('partial backend stop failure blocks import and requests review before restoring the window', async t => {
-  const f = await fixture(t, { request: async (_, action) => action === 'prepare_pause' ? { ok: false, error: 'stop_failed', state: { shutdown_failed: true } } : { ok: true, state: { busy: false, idle_seconds: 60 } } });
+  const f = await fixture(t, { request: async (_, action) => action === 'prepare_pause' ? { ok: false, error: 'stop_failed', state: { shutdown_failed: true } } : { ok: true, state: { ...healthyRecoveryState } } });
   await assert.rejects(f.coordinator.check(), /postponed/);
   assert.ok(!f.calls.includes('sync'));
   assert.deepEqual(f.calls, ['preview', 'recovery', 'disable-review', 'reload']);
@@ -430,5 +458,88 @@ test('a dirty document appearing during import prevents the final reload and ret
   await fs.access(path.join(f.config.stateDir, 'pause.json'));
   assert.ok(!f.calls.includes('reload'));
   assert.ok(f.calls.includes('disable-review'));
+});
+
+test('confirmation mode previews eligible updates without pausing, importing or reloading', async t => {
+  const f = await fixture(t, { confirmReload: async manual => manual });
+  assert.equal((await f.coordinator.check()).reason, 'reload_confirmation');
+  assert.deepEqual(f.calls, ['preview', 'status']);
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+  assert.equal((await f.coordinator.check({ manual: true })).kind, 'synced');
+});
+
+test('disable while preview or confirmation is pending cancels before creating a pause lease', async t => {
+  for (const stage of ['preview', 'confirmation']) {
+    let enabled = true;
+    const f = await fixture(t, { shouldContinue: () => enabled });
+    if (stage === 'preview') {
+      const original = f.coordinator.runWindows;
+      f.coordinator.runWindows = async (...args) => { const value = await original(...args); enabled = false; return value; };
+    } else f.coordinator.confirmReload = async () => { enabled = false; return true; };
+    assert.equal((await f.coordinator.check({ manual: true })).reason, 'sync_disabled');
+    assert.ok(!f.calls.includes('prepare_pause'));
+    assert.ok(!f.calls.includes('sync'));
+    assert.ok(!f.calls.includes('reload'));
+    await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+  }
+});
+
+test('disable after pausing skips import and safely restores the already-paused backend', async t => {
+  let enabled = true;
+  const f = await fixture(t, { shouldContinue: () => enabled });
+  const original = f.coordinator.request;
+  f.coordinator.request = async (...args) => { const value = await original(...args); if (args[1] === 'prepare_pause') enabled = false; return value; };
+  assert.equal((await f.coordinator.check()).reason, 'sync_disabled');
+  assert.ok(!f.calls.includes('sync'));
+  assert.ok(f.calls.includes('recovery'));
+  assert.ok(f.calls.includes('reload'));
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+});
+
+test('missing or malformed idle health fields never admit a pause', async t => {
+  for (const change of [{ busy: undefined }, { busy: 0 }, { child_running: undefined }, { shutdown_failed: undefined },
+    { starting: undefined }, { paused: undefined }, { child_pid: 0 }, { child_pid: '202' },
+    { pending_request_count: undefined }, { server_request_count: undefined }, { active_turn_count: undefined }, { known_activity_count: undefined }]) {
+    const f = await fixture(t, { request: async () => ({ ok: true, state: { ...healthyRecoveryState, ...change } }) });
+    assert.equal((await f.coordinator.check()).reason, 'codex_busy');
+    assert.deepEqual(f.calls, ['preview']);
+    await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+  }
+});
+
+test('a malformed paused acknowledgment blocks import and requires verified recovery', async t => {
+  const f = await fixture(t);
+  const original = f.coordinator.request;
+  f.coordinator.request = async (...args) => { const value = await original(...args); if (value.state?.paused) delete value.state.shutdown_failed; return value; };
+  await assert.rejects(f.coordinator.check(), /has not paused/);
+  assert.ok(!f.calls.includes('sync'));
+  assert.ok(f.calls.includes('disable-review'));
+  assert.ok(f.calls.includes('recovery'));
+});
+
+test('conflict commands pass exact side and expected token without a merge or resume operation', () => {
+  const config = { stateDir: '/tmp/state', windowsPython: '/mnt/c/python.exe', windowsController: 'C:\\Sync Folder\\history_sync.py', windowsConfig: 'C:\\Sync Folder\\config.json', previewHelper: 'C:\\Sync Folder\\preview_sync.py' };
+  const id = '11111111-1111-7111-8111-111111111111';
+  const expectedToken = 'a'.repeat(64);
+  assert.deepEqual(mergeArguments(config, { type: 'list' }), ['C:\\Sync Folder\\merge_chat.py', '--controller', config.windowsController, '--config', config.windowsConfig, '--list']);
+  for (const keepSide of ['windows', 'wsl']) assert.deepEqual(mergeArguments({ ...config, mergeHelper: 'D:\\Tools\\merge_chat.py' }, { type: 'id', value: id, keepSide, expectedToken }),
+    ['D:\\Tools\\merge_chat.py', '--controller', config.windowsController, '--config', config.windowsConfig, '--id', id, '--keep-side', keepSide, '--expected-token', expectedToken]);
+  for (const action of [{ type: 'delete', value: id }, { type: 'resume', value: id }, { type: 'id', value: id },
+    { type: 'id', value: '--help', keepSide: 'windows', expectedToken }, { type: 'id', value: id, keepSide: 'both', expectedToken },
+    { type: 'id', value: id, keepSide: 'wsl', expectedToken: '../private' }]) assert.throws(() => mergeArguments(config, action));
+  assert.throws(() => mergeArguments({ ...config, mergeHelper: '/mnt/c/merge.py' }, { type: 'list' }));
+});
+
+test('merge runner handles safe JSON and hides process errors, private paths and malformed results', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-merge-helper-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, 'fake-python');
+  const config = { stateDir: directory, windowsPython: executable, windowsController: 'C:\\Sync\\history_sync.py', windowsConfig: 'C:\\Sync\\config.json', previewHelper: 'C:\\Sync\\preview_sync.py' };
+  await fs.writeFile(executable, '#!/bin/sh\nprintf "%s\\n" \'{"ok":true,"status":"candidates","chats":[]}\'\n', { mode: 0o700 });
+  assert.deepEqual(await runMergeWindows(config, { type: 'list' }), { ok: true, status: 'candidates', chats: [] });
+  for (const script of ['#!/bin/sh\nprintf "%s\\n" "private/path secret" >&2\nexit 1\n', '#!/bin/sh\nprintf "%s\\n" \'{"ok":true,"status":"unknown"}\'\n']) {
+    await fs.writeFile(executable, script, { mode: 0o700 });
+    await assert.rejects(runMergeWindows(config, { type: 'list' }), error => error.message.includes('恢复记录') && !error.message.includes('private/path'));
+  }
 });
 

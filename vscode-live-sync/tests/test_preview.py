@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -303,5 +304,96 @@ class PreviewTests(unittest.TestCase):
                 result=preview.sync_once(controller,controller)
                 ack.assert_not_called(); execute.assert_not_called()
             self.assertEqual(result['status'],'skipped_already_running')
+
+class ManualChoicePreview(unittest.TestCase):
+    def inputs(self, runtime, keep='windows'):
+        win, lin = record('win-selected', 'win-body'), record('wsl-selected', 'wsl-body')
+        choice_id = '30000000-0000-4000-8000-000000000001'
+        choice = {'id': win['id'], 'choice_id': choice_id, 'keep_side': keep, 'status': 'pending',
+                  'expected': {'windows': win['revision'], 'wsl': lin['revision']}, 'package_hashes': {}}
+        for side, row in (('windows', win), ('wsl', lin)):
+            folder = runtime / 'conflict-choices' / choice_id / side
+            folder.mkdir(parents=True)
+            sync.atomic_json(folder / 'meta.json', {'thread': {'id': win['id']}, 'source_revision': row})
+            (folder / 'history.sqlite').write_bytes(b'synthetic cache')
+            (folder / 'transcript.jsonl').write_bytes(b'synthetic transcript')
+            choice['package_hashes'][side] = {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
+                                             for name in ('meta.json', 'history.sqlite', 'transcript.jsonl')}
+        sync.atomic_json(runtime / 'conflict-choices.json', {'version': 1, 'choices': {win['id']: choice}})
+        ledger = {'version': 1, 'threads': {win['id']: {'windows': deepcopy(win), 'wsl': deepcopy(lin), 'body_diverged': True}}}
+        views = {'windows': {'threads': [win], 'backend_running': True},
+                 'wsl': {'threads': [lin], 'backend_running': True}}
+        return views, ledger, choice
+
+    def test_windows_choice_admits_pause_without_mutating_selection_or_ledger(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder)
+            views, ledger, _ = self.inputs(runtime)
+            before = (runtime / 'conflict-choices.json').read_bytes(), deepcopy(ledger)
+            result = preview.classify_plan(sync, views['windows'], views['wsl'], ledger, 60, runtime=runtime)
+            self.assertTrue(result['eligible'])
+            self.assertEqual(result['reason'], 'existing_replica_updates')
+            self.assertEqual(result['conflict_count'], 0)
+            self.assertEqual(before, ((runtime / 'conflict-choices.json').read_bytes(), ledger))
+            self.assertTrue(views['wsl']['backend_running'])
+
+    def test_wsl_choice_waits_for_desktop_without_pausing_wsl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder)
+            views, ledger, _ = self.inputs(runtime, 'wsl')
+            result = preview.classify_plan(sync, views['windows'], views['wsl'], ledger, 60, runtime=runtime)
+            self.assertFalse(result['eligible'])
+            self.assertEqual(result['opposite_direction_count'], 1)
+            self.assertEqual(result['blocked_reason_counts'], {'target_backend_running': 1})
+
+    def test_either_side_edit_requires_fresh_choice_and_never_admits_pause(self):
+        for side in ('windows', 'wsl'):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as folder:
+                runtime = Path(folder)
+                views, ledger, _ = self.inputs(runtime)
+                views[side]['threads'][0]['revision'] = 'continued-after-confirmation'
+                before = (runtime / 'conflict-choices.json').read_bytes()
+                result = preview.classify_plan(sync, views['windows'], views['wsl'], ledger, 60, runtime=runtime)
+                self.assertFalse(result['eligible'])
+                self.assertEqual(result['reason'], 'chat_conflict')
+                self.assertEqual(result['blocked_reason_counts'], {'manual_choice_stale': 1})
+                self.assertEqual((runtime / 'conflict-choices.json').read_bytes(), before)
+
+    def test_settings_proof_cannot_advance_a_human_choice(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder)
+            views, ledger, _ = self.inputs(runtime)
+            views['wsl']['threads'][0]['revision'] = 'later-local-setting'
+            with patch.object(preview, 'call_native_probe', side_effect=AssertionError('Must not acknowledge a bound choice')):
+                virtual, proofs = preview.virtual_local_settings_ledger(sync, views['windows'], views['wsl'], ledger,
+                    60, lambda *_: (_ for _ in ()).throw(AssertionError('Must not prove bound choice')), runtime=runtime)
+            self.assertEqual(virtual, ledger)
+            self.assertEqual(proofs, {})
+
+    def test_tampered_backup_fails_before_a_reload_is_proposed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder)
+            views, ledger, choice = self.inputs(runtime)
+            (runtime / 'conflict-choices' / choice['choice_id'] / 'wsl' / 'transcript.jsonl').write_bytes(b'tampered')
+            with self.assertRaisesRegex(RuntimeError, 'backup changed'):
+                preview.classify_plan(sync, views['windows'], views['wsl'], ledger, 60, runtime=runtime)
+
+class BusyControllerPreview(unittest.TestCase):
+    def test_running_task_prevents_scanning_or_proposing_backend_pause(self):
+        fake = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=0,
+                               locking=lambda *args: (_ for _ in ()).throw(OSError('busy')))
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = Path(folder)
+            (runtime / 'ledger.json').write_text('{}')
+            (runtime / 'run.lock').write_bytes(b'0')
+            controller = ROOT.parent / 'history_sync.py'
+            with patch.object(preview.os, 'name', 'nt'), patch.dict(sys.modules, {'msvcrt': fake}), \
+                 patch.object(preview, 'load_controller', return_value=(controller, sync, {'wsl_distro': 'synthetic'}, runtime)), \
+                 patch.object(sync, 'wsl_running', return_value=True), \
+                 patch.object(sync, 'Endpoints', side_effect=AssertionError('Busy task must not be scanned')):
+                result = preview.probe(controller, controller)
+            self.assertFalse(result['eligible'])
+            self.assertEqual(result['reason'], 'controller_running')
+
 
 if __name__=='__main__': unittest.main()

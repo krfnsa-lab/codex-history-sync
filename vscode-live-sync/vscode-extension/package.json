@@ -1,8 +1,8 @@
 {
   "name": "codex-history-live-sync",
-  "displayName": "Codex History Live Sync (Preview)",
-  "description": "Coordinates idle WSL history imports and a VS Code window reload.",
-  "version": "0.1.5",
+  "displayName": "Codex History Sync",
+  "description": "Checks Windows/WSL history, applies confirmed updates, and resolves conflicts by an explicit choice of the Windows or WSL version.",
+  "version": "1.0.0",
   "publisher": "krfnsa-lab",
   "license": "MIT",
   "engines": { "vscode": "^1.90.0" },
@@ -16,19 +16,22 @@
       { "command": "codexHistoryLiveSync.disableRestore", "title": "Codex History: Disable and Restore Original Codex" },
       { "command": "codexHistoryLiveSync.enable", "title": "Codex History: Enable Automatic Sync" },
       { "command": "codexHistoryLiveSync.disable", "title": "Codex History: Disable Automatic Sync" },
-      { "command": "codexHistoryLiveSync.checkNow", "title": "Codex History: Check for New Messages" }
+      { "command": "codexHistoryLiveSync.checkNow", "title": "Codex History: Check for New Messages" },
+      { "command": "codexHistoryLiveSync.resolveConflicts", "title": "Codex History: Resolve Chat Conflicts" }
     ],
     "configuration": {
       "title": "Codex History Live Sync",
       "properties": {
-        "codexHistoryLiveSync.enabled": { "type": "boolean", "default": false, "scope": "machine-overridable", "description": "Enable idle history sync and automatic window reload in a WSL workspace." },
+        "codexHistoryLiveSync.enabled": { "type": "boolean", "default": false, "scope": "machine-overridable", "description": "Check for idle history updates in a WSL workspace; confirm before applying by default." },
+        "codexHistoryLiveSync.reloadMode": { "type": "string", "enum": ["confirm", "automatic"], "default": "confirm", "scope": "machine-overridable", "description": "Confirm before syncing and reloading by default. Automatic reload is opt-in and cannot detect unsent Codex chat drafts." },
         "codexHistoryLiveSync.intervalSeconds": { "type": "integer", "default": 60, "minimum": 30, "scope": "machine-overridable" },
         "codexHistoryLiveSync.controllerTimeoutSeconds": { "type": "integer", "default": 600, "minimum": 180, "scope": "machine-overridable", "description": "Windows sync timeout; must exceed the controller run budget plus three endpoint timeouts and 60 seconds." },
         "codexHistoryLiveSync.stateDir": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Linux directory shared with the optional Codex gateway." },
         "codexHistoryLiveSync.windowsPython": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Executable Linux mount path to native Windows Python, for example /mnt/c/.../python.exe." },
         "codexHistoryLiveSync.windowsController": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Windows path to history_sync.py." },
         "codexHistoryLiveSync.windowsConfig": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Windows path to the personal synchronizer config." },
-        "codexHistoryLiveSync.previewHelper": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Windows path to the read-only eligible-transfer preview helper." }
+        "codexHistoryLiveSync.previewHelper": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Windows path to the read-only eligible-transfer preview helper." },
+        "codexHistoryLiveSync.mergeHelper": { "type": "string", "default": "", "scope": "machine-overridable", "description": "Absolute Windows path to merge_chat.py; empty uses the preview helper directory. Manual conflict resolution backs up both versions and saves the chosen side for safe synchronization." }
       }
     }
   }

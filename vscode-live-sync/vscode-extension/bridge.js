@@ -8,6 +8,10 @@ const { promisify } = require('node:util');
 const execFileAsync = promisify(execFile);
 
 function validateConfig(config) {
+  if (config.reloadMode !== undefined && !['confirm', 'automatic'].includes(config.reloadMode)) throw new Error('Choose confirm or automatic for the window reload mode.');
+  for (const [key, minimum] of [['intervalSeconds', 30], ['controllerTimeoutSeconds', 180]]) {
+    if (config[key] !== undefined && (!Number.isInteger(config[key]) || config[key] < minimum)) throw new Error('Configure valid sync intervals and timeouts.');
+  }
   for (const key of ['stateDir', 'windowsPython']) {
     if (typeof config[key] !== 'string' || !path.posix.isAbsolute(config[key]) || config[key].includes('\0')) {
       throw new Error('Configure absolute Linux paths for the sync bridge.');
@@ -17,6 +21,37 @@ function validateConfig(config) {
     if (typeof config[key] !== 'string' || !/^[A-Za-z]:[\\/]/.test(config[key]) || config[key].includes('\0')) {
       throw new Error('Configure absolute Windows paths for the synchronizer.');
     }
+  }
+  if (config.mergeHelper !== undefined && config.mergeHelper !== '' &&
+      (typeof config.mergeHelper !== 'string' || !/^[A-Za-z]:[\\/]/.test(config.mergeHelper) || config.mergeHelper.includes('\0'))) {
+    throw new Error('Configure an absolute Windows path for the merge helper.');
+  }
+}
+
+function mergeArguments(config, action) {
+  validateConfig(config);
+  const helper = config.mergeHelper || path.win32.join(path.win32.dirname(config.previewHelper), 'merge_chat.py');
+  const args = [helper, '--controller', config.windowsController, '--config', config.windowsConfig];
+  if (action?.type === 'list') return [...args, '--list'];
+  if (action?.type !== 'id' || typeof action.value !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(action.value) ||
+      !['windows', 'wsl'].includes(action.keepSide) || typeof action.expectedToken !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(action.expectedToken)) throw new Error('Choose a valid chat version from the current conflict list.');
+  return [...args, '--id', action.value, '--keep-side', action.keepSide, '--expected-token', action.expectedToken];
+}
+
+async function runMergeWindows(config, action) {
+  const args = mergeArguments(config, action);
+  try {
+    const { stdout } = await execFileAsync(config.windowsPython, args, {
+      timeout: Math.max(1200, config.controllerTimeoutSeconds || 600) * 1000,
+      maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+    });
+    const result = JSON.parse(stdout.trim());
+    if (!result || typeof result.ok !== 'boolean' || !['candidates', 'waiting', 'choice_saved', 'error'].includes(result.status)) throw new Error('Invalid conflict result.');
+    return result;
+  } catch {
+    throw new Error('冲突处理未完成。请查看恢复记录或重新安装冲突处理工具后重试。');
   }
 }
 
@@ -119,11 +154,14 @@ function previewResult(preview) {
 function describeResult(result) {
   const reasons = {
     chat_conflict: '同一聊天两端均有修改，或原有正文不同。已保留两端记录，未自动覆盖；需要检查冲突。',
+    manual_choice_stale: '之前手动选择的聊天版本已经变化，未按旧选择覆盖聊天。请重新检查并确认保留 Windows 还是 WSL。',
     chat_busy: '聊天正在进行或尚未静默 60 秒。此次未同步，空闲后会再次检查。',
     dirty_editor: '存在未保存的文件。请先保存，之后会自动重试同步。',
     debugging: '正在调试。调试结束后会自动重试同步。',
     editor_not_idle: '编辑器有未保存内容或正在调试，此次未同步。',
     check_running: '已有同步检查正在进行，请等待本轮结束。',
+    reload_confirmation: '有新记录待同步。请点击此状态，确认聊天输入框中的草稿已发送或保存后同步并重载窗口。',
+    sync_disabled: '同步设置已变更或自动同步已停用，本轮未继续导入。',
     retry_backoff: '上次未传输记录，正在等待重试时间。此次没有同步。',
     other_native_backends: '检测到其他独立或无法确认归属的 Codex 进程，同步暂缓。这不一定表示打开了多个 VS Code 窗口。',
     multiple_windows: '检测到多个同步桥窗口，此次未同步。请只保留一个 WSL Codex 窗口。',
@@ -149,10 +187,14 @@ function describeResult(result) {
   };
   if (result.kind === 'synced' && Number.isInteger(result.result?.transferred) && result.result.transferred > 0) {
     const conflicts = Number.isInteger(result.preview?.conflict_count) && result.preview.conflict_count > 0 ? result.preview.conflict_count : 0;
+    const resolved = Number.isInteger(result.result.resolved_conflicts) && result.result.resolved_conflicts > 0 ? result.result.resolved_conflicts : 0;
+    const manualResolved = Array.isArray(result.result.conflict_results) ? result.result.conflict_results.filter(choice => choice.reason === 'manual_keep').length : 0;
+    const resolutionDetail = resolved ? `其中 ${resolved} 条冲突已处理${manualResolved ? `，${manualResolved} 条按你的选择保留版本` : ''}，被替换的版本已备份。` : '';
     return { text: conflicts ? '$(warning) Codex：部分已同步，仍有冲突' : '$(check) Codex：新记录已同步',
-      detail: `本轮实际同步 ${result.result.transferred} 条聊天。` + (result.result.resolved_conflicts > 0 ? `其中 ${result.result.resolved_conflicts} 条按聊天数量选择版本，被替换的版本已备份。` : '') + (conflicts ? `另有 ${conflicts} 条聊天存在冲突，已保留两端记录。` : ''), warning: conflicts > 0 };
+      detail: `本轮实际同步 ${result.result.transferred} 条聊天。` + resolutionDetail + (conflicts ? `另有 ${conflicts} 条聊天存在冲突，已保留两端记录。` : ''), warning: conflicts > 0 };
   }
   const text = result.kind === 'conflict' ? '$(warning) Codex：未同步，聊天冲突'
+    : result.reason === 'reload_confirmation' ? '$(history) Codex：有更新，点击确认同步'
     : result.kind === 'current' ? '$(history) Codex：没有待同步更新'
     : result.kind === 'blocked' ? '$(warning) Codex：未同步，需要检查'
     : result.kind === 'unavailable' ? '$(history) Codex：尚未连接同步桥'
@@ -169,13 +211,20 @@ function describeResult(result) {
     .map(([side, count]) => `${side === 'windows' ? 'Windows' : 'WSL'} ${count} 条`).join('；') + '。替换前会完整备份旧版本。'
     + (selections.some(choice => choice.source === 'wsl' && choice.waiting_reason === 'target_backend_running')
       ? 'WSL 较多的记录需等待桌面端后端停止。' : '') : '';
+  const manual = Array.isArray(result.preview?.manual_choices) ? result.preview.manual_choices.filter(choice => ['windows', 'wsl'].includes(choice.keep_side) && choice.reason !== 'manual_choice_stale') : [];
+  const manualDetail = manual.length ? '\n已手动选择：' + ['windows', 'wsl'].map(side => [side, manual.filter(choice => choice.keep_side === side).length])
+    .filter(([, count]) => count > 0).map(([side, count]) => `${side === 'windows' ? 'Windows' : 'WSL'} ${count} 条`).join('；') + '。选择已保存，尚未同步；等待目标后端停止且双方版本保持不变。' : '';
+  const stale = result.preview?.blocked_reason_counts?.manual_choice_stale > 0;
+  const incompatible = result.preview?.blocked_reason_counts?.workspace_cwd_unmappable > 0;
   const diagnostics = Object.entries(result.preview?.blocked_reason_counts || {})
     .filter(([key, count]) => /^[a-z_]+$/.test(key) && Number.isInteger(count) && count > 0)
     .map(([key, count]) => `${key}：${count}`).join('；');
-  const explanation = result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
+  const explanation = stale ? reasons.manual_choice_stale
+    : incompatible ? '聊天工作目录无法映射到目标系统中存在的目录。未替换聊天，请检查工作目录兼容性。'
+    : result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
     ? '两端聊天数量相同、无法可靠比较，或尚未建立可用基线。已保留两端，未自动选择版本。'
     : reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
-  return { text: selectedText, detail: explanation + selectionDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
+  return { text: selectedText, detail: explanation + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
     warning: ['conflict', 'blocked'].includes(result.kind) };
 }
 
@@ -187,6 +236,8 @@ class Coordinator {
     this.runWindows = dependencies.runWindows || runWindows;
     this.reload = dependencies.reload || (() => Promise.resolve());
     this.canReload = dependencies.canReload || (() => true);
+    this.shouldContinue = dependencies.shouldContinue || (() => true);
+    this.confirmReload = dependencies.confirmReload || (() => Promise.resolve(true));
     this.reloadBlockReason = dependencies.reloadBlockReason || (() => 'editor_not_idle');
     this.onFailure = dependencies.onFailure || (() => Promise.resolve());
     this.onDeferred = dependencies.onDeferred || (() => Promise.resolve());
@@ -235,15 +286,17 @@ class Coordinator {
     } finally { this.running = false; }
   }
 
-  async check() {
+  async check(options = {}) {
     if (this.running) return { kind: 'waiting', reason: 'check_running' };
     this.running = true;
     let lease = null; let pauseStarted = false; let operationFailed = false; let operationError;
     const pauseFile = path.join(this.config.stateDir, 'pause.json');
     try {
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled' };
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason() };
       if (Date.now() < this.nextAttemptAt()) return { kind: 'waiting', reason: 'retry_backoff' };
       const preview = await this.runWindows(this.config, true);
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (preview.eligible !== true || !Array.isArray(preview.candidate_ids) || preview.candidate_ids.length === 0) return previewResult(preview);
       if (Number.isFinite(preview.controller_timeout_seconds)) this.config.controllerTimeoutSeconds = Math.max(this.config.controllerTimeoutSeconds || 600, preview.controller_timeout_seconds);
       const instances = await this.discover(this.config.stateDir);
@@ -256,10 +309,15 @@ class Coordinator {
             (!Number.isInteger(preview.native_backend_pid) || status.state?.child_pid !== preview.native_backend_pid)) {
           return { kind: 'waiting', reason: 'instances_changed', preview };
         }
-        if (!status.ok || !status.state || status.state.busy || status.state.starting || status.state.paused ||
-            status.state.pending_request_count || status.state.server_request_count || status.state.active_turn_count || status.state.known_activity_count ||
-            !Number.isFinite(status.state.idle_seconds) || status.state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview };
+        const state = status.state;
+        if (status.ok !== true || !state || state.busy !== false || state.starting !== false || state.paused !== false ||
+            state.child_running !== true || state.shutdown_failed !== false || !Number.isInteger(state.child_pid) || state.child_pid <= 0 ||
+            ['pending_request_count', 'server_request_count', 'active_turn_count', 'known_activity_count'].some(key => state[key] !== 0) ||
+            !Number.isFinite(state.idle_seconds) || state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview };
       }
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
+      if (!await this.confirmReload(options.manual === true)) return { kind: 'waiting', reason: 'reload_confirmation', preview };
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason(), preview };
       await secureDirectory(this.config.stateDir);
       const proposedLease = { protocol_version: 1, owner: 'vscode-companion', nonce: crypto.randomBytes(24).toString('hex'), pid: process.pid, created_at: new Date().toISOString() };
@@ -268,6 +326,7 @@ class Coordinator {
       catch (error) { if (error.code === 'EEXIST') return { kind: 'waiting', reason: 'existing_pause', preview }; throw error; }
       lease = proposedLease;
       try { await handle.writeFile(JSON.stringify(lease)); await handle.sync(); } finally { await handle.close(); }
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!sameInstances(instances, await this.discover(this.config.stateDir))) return { kind: 'waiting', reason: 'instances_changed', preview };
       for (const instance of instances) {
         let paused;
@@ -278,12 +337,16 @@ class Coordinator {
         if (!paused.ok || paused.paused !== true) throw new Error('Codex became busy; the update was postponed.');
         pauseStarted = true;
       }
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       // New extension windows are refused rather than left running across an import.
       if (!sameInstances(instances, await this.discover(this.config.stateDir))) throw new Error('A new Codex window opened; the update was postponed.');
       for (const instance of instances) {
         const paused = await this.request(instance, 'status');
-        if (!paused.ok || !paused.state || !paused.state.paused || paused.state.child_running || paused.state.busy) throw new Error('The Codex bridge has not paused.');
+        if (paused.ok !== true || !paused.state || paused.state.paused !== true || paused.state.child_running !== false ||
+            paused.state.busy !== false || paused.state.shutdown_failed !== false || paused.state.starting !== false ||
+            ['pending_request_count', 'server_request_count', 'active_turn_count', 'known_activity_count'].some(key => paused.state[key] !== 0)) throw new Error('The Codex bridge has not paused.');
       }
+      if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (!this.canReload()) throw new Error('Unsaved work appeared; the update was postponed.');
       const result = await this.runWindows(this.config, false);
       if (result.status !== 'completed' && result.status !== 'skipped_already_running') throw new Error('The synchronizer needs review before another update.');
@@ -330,4 +393,4 @@ class Coordinator {
   }
 }
 
-module.exports = { Coordinator, validateConfig, discoverInstances, readPrivateJson, runWindows, sameInstances, previewResult, describeResult };
+module.exports = { Coordinator, validateConfig, discoverInstances, readPrivateJson, runWindows, runMergeWindows, mergeArguments, sameInstances, previewResult, describeResult };

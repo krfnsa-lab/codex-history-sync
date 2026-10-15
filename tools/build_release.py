@@ -19,13 +19,15 @@ import zipfile
 
 ARCHIVE_ROOT = "codex-history-sync"
 REQUIRED_FILES = frozenset((
-    "history_endpoint.py", "history_sync.py", "setup.py", "config.example.json",
+    "history_endpoint.py", "history_sync.py", "history_merge.py", "merge_chat.py", "merge_validate.py", "setup.py", "config.example.json",
     "install.ps1", "uninstall.ps1", "sync-now.ps1", "status.ps1", "doctor.ps1", "repair-paths.ps1",
     "configure.ps1", "Common.ps1", "README.md", "CHANGELOG.md", "LICENSE", ".gitignore",
     "docs/SAFETY.md", "docs/CONFIGURATION.md", ".github/workflows/ci.yml",
     "tools/build_release.py", "tests/test_endpoint.py", "tests/test_diagnostics.py",
     "tests/test_history_endpoint_review.py", "tests/test_history_sync_review.py",
     "tests/test_prefer_longer.py", "tests/test_prefer_longer_backup.py",
+    "tests/test_merge.py",
+    "tests/test_merge_chat.py", "tests/test_merge_validate.py",
 ))
 OPTIONAL_ROOT_FILES = frozenset(("CONTRIBUTING.md", "SECURITY.md", "VALIDATION.md"))
 LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (

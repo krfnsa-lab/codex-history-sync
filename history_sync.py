@@ -6,6 +6,7 @@ reads/writes, so live SQLite is never opened through the opposite OS mount.
 """
 import argparse
 import ctypes
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -18,9 +19,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 VERSION = 1
-SOFTWARE_VERSION = '2.1.0-beta.6'
+SOFTWARE_VERSION = '2.1.0'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -212,6 +214,14 @@ def linux_mount_path(path):
     return '/mnt/' + path.drive[0].lower() + '/' + '/'.join(path.parts[1:])
 
 
+class EndpointCallError(RuntimeError):
+    """Keep native error codes separate from messages for narrow retry rules."""
+    def __init__(self, side, operation, code, message):
+        super().__init__(f'{side} {operation}: {message}')
+        self.side, self.operation = side, operation
+        self.code = code if isinstance(code, str) else 'endpoint_error'
+
+
 class Endpoints:
     def __init__(self, config, script_dir):
         self.config = config
@@ -232,9 +242,11 @@ class Endpoints:
             value = json.loads(decode_output(result.stdout))
         except (json.JSONDecodeError, UnicodeError):
             raise RuntimeError(f'{side} {operation}: invalid endpoint response') from None
-        if result.returncode or value.get('error'):
+        if not isinstance(value, dict):
+            raise RuntimeError(f'{side} {operation}: invalid endpoint response')
+        if result.returncode or value.get('error') or value.get('ok') is False:
             reason = value.get('message', value.get('error', value.get('code', 'failed')))
-            raise RuntimeError(f'{side} {operation}: {reason}')
+            raise EndpointCallError(side, operation, value.get('code'), reason)
         return value
 
     def inspect(self, side):
@@ -257,6 +269,99 @@ def atomic_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def choice_token(thread_id, source_records):
+    value = {'id': thread_id, **{side: source_records[side]['revision'] for side in ('windows', 'wsl')}}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def read_conflict_choices(runtime):
+    path = runtime / 'conflict-choices.json'
+    if not path.exists():
+        return {'version': 1, 'choices': {}}
+    value = json.loads(path.read_text(encoding='utf-8'))
+    if type(value.get('version')) is not int or value['version'] != 1 or not isinstance(value.get('choices'), dict):
+        raise RuntimeError('Unsupported manual conflict-choice store')
+    for tid, choice in value['choices'].items():
+        if (not isinstance(choice, dict) or choice.get('id') != tid
+                or choice.get('keep_side') not in ('windows', 'wsl')
+                or choice.get('status') not in ('pending', 'needs_confirmation', 'resolved')):
+            raise RuntimeError('Invalid manual conflict choice')
+        if str(uuid.UUID(choice.get('choice_id', ''))) != choice['choice_id']:
+            raise RuntimeError('Invalid manual conflict-choice identity')
+        expected = choice.get('expected', {})
+        if set(expected) != {'windows', 'wsl'} or any(not isinstance(v, str) or not v for v in expected.values()):
+            raise RuntimeError('Manual conflict choice has no exact source versions')
+    return value
+
+
+def conflict_choice_package(runtime, choice, side):
+    root = runtime / 'conflict-choices'
+    folder = root / choice['choice_id'] / side
+    if folder.is_symlink() or not folder.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError('Unexpected manual-choice backup path')
+    hashes = choice.get('package_hashes', {}).get(side, {})
+    if set(hashes) != {'meta.json', 'history.sqlite', 'transcript.jsonl'}:
+        raise RuntimeError('Manual choice is missing a complete private backup')
+    for name, expected in hashes.items():
+        path = folder / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('Manual-choice backup is missing or unsafe')
+        hasher = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(512 * 1024), b''):
+                hasher.update(chunk)
+        if hasher.hexdigest() != expected:
+            raise RuntimeError('Manual-choice backup changed; preserved records require review')
+    meta = json.loads((folder / 'meta.json').read_text(encoding='utf-8'))
+    if meta.get('thread', {}).get('id') != choice['id'] or meta.get('source_revision', {}).get('revision') != choice['expected'][side]:
+        raise RuntimeError('Manual-choice backup does not match the confirmed version')
+    return folder
+
+
+def add_manual_choices(plan, views, runtime, quiet_seconds):
+    """Use explicit exact-version decisions without a count-based overwrite."""
+    store = read_conflict_choices(runtime)
+    states = {side: records(view) for side, view in views.items()}
+    decisions, updates = [], {}
+    for tid, choice in store['choices'].items():
+        if choice['status'] == 'resolved':
+            continue
+        plan['actions'] = [a for a in plan['actions'] if a['id'] != tid]
+        plan['blocked'] = [a for a in plan['blocked'] if a['id'] != tid]
+        plan['baseline_pairs'] = [value for value in plan['baseline_pairs'] if value != tid]
+        if 'conflict_decisions' in plan:
+            plan['conflict_decisions'] = [value for value in plan['conflict_decisions'] if value['id'] != tid]
+        rows = {side: states[side].get(tid) for side in states}
+        reason = None
+        if choice['status'] == 'needs_confirmation' or any(
+                row is None or row['revision'] != choice['expected'][side] for side, row in rows.items()):
+            reason = 'manual_choice_stale'
+            updates[tid] = {**choice, 'status': 'needs_confirmation'}
+        elif any(is_busy(row, quiet_seconds) for row in rows.values()):
+            reason = 'source_busy'
+        elif any(row.get('transcript_complete') is not True or row.get('item_count', 0) <= 0 for row in rows.values()):
+            reason = 'unreadable_transcript'
+        target = 'wsl' if choice['keep_side'] == 'windows' else 'windows'
+        if reason is None and views[target].get('backend_running', True):
+            reason = 'target_backend_running'
+        decision = {'id': tid, 'choice_id': choice['choice_id'], 'keep_side': choice['keep_side'],
+                    'status': 'waiting' if reason else 'ready'}
+        decisions.append(decision)
+        if reason:
+            decision['reason'] = reason
+            plan['blocked'].append({'id': tid, 'reason': reason, 'conflict_resolution': 'manual_keep'})
+            continue
+        for side in ('windows', 'wsl'):
+            conflict_choice_package(runtime, choice, side)
+        plan['actions'].append({'id': tid, 'source': choice['keep_side'], 'target': target, 'mode': 'full',
+                                'source_revision': choice['expected'][choice['keep_side']],
+                                'target_revision': choice['expected'][target],
+                                'conflict_resolution': 'manual_keep', 'choice_id': choice['choice_id']})
+    if decisions:
+        plan['manual_choices'] = decisions
+    return store, updates
 
 
 @contextmanager
@@ -313,6 +418,8 @@ def execute(config, args, runtime, log, progress=None):
         raise RuntimeError('Unsupported synchronization ledger version')
     plan = build_plan(windows, wsl, ledger, config.get('quiet_seconds', 60),
                       config.get('conflict_resolution', 'manual'))
+    choice_store, choice_updates = add_manual_choices(plan, {'windows': windows, 'wsl': wsl}, runtime,
+                                                     config.get('quiet_seconds', 60))
     summary = progress if progress is not None else {}
     summary.update({'status': 'dry_run' if args.dry_run else 'completed', 'initialization_required': not initialized,
                'planned_transfers': len(plan['actions']), 'blocked': plan['blocked'], 'transferred': 0,
@@ -325,6 +432,10 @@ def execute(config, args, runtime, log, progress=None):
         summary['conflict_decisions'] = plan['conflict_decisions']
         summary['resolved_conflicts'] = 0
         summary['conflict_results'] = []
+    if 'manual_choices' in plan:
+        summary['manual_choices'] = plan['manual_choices']
+        summary.setdefault('resolved_conflicts', 0)
+        summary.setdefault('conflict_results', [])
     if args.dry_run:
         summary['actions'] = plan['actions']
         return finish(summary)
@@ -333,6 +444,9 @@ def execute(config, args, runtime, log, progress=None):
     journal = runtime / 'pending.json'
     if journal.exists():
         raise RuntimeError('An unfinished prior import exists; review runtime/pending.json before continuing')
+    if choice_updates:
+        choice_store['choices'].update(choice_updates)
+        atomic_json(runtime / 'conflict-choices.json', choice_store)
     for tid in plan['baseline_pairs']:
         a, b = states['windows'][tid], states['wsl'][tid]
         ledger['threads'][tid] = {'windows': a, 'wsl': b, 'body_diverged': a['content_revision'] != b['content_revision']}
@@ -349,21 +463,69 @@ def execute(config, args, runtime, log, progress=None):
             break
         summary['attempted_transfers'] += 1
         with tempfile.TemporaryDirectory(prefix='transfer-', dir=runtime) as package:
+            manual_choice = None
+            if action.get('conflict_resolution') == 'manual_keep':
+                manual_choice = choice_store['choices'][action['id']]
+                package = conflict_choice_package(runtime, manual_choice, action['source'])
+                # Validate BOTH preserved versions immediately before using a
+                # queued choice. Neither original may be silently reconfirmed.
+                conflict_choice_package(runtime, manual_choice, action['target'])
             source_package = package if action['source'] == 'windows' else linux_mount_path(package)
             target_package = package if action['target'] == 'windows' else linux_mount_path(package)
             options = ['--metadata-only'] if action['mode'] == 'metadata' else []
-            endpoint.call(action['source'], 'export', '--id', action['id'], '--package', source_package, '--expected', action['source_revision'], *options)
+            try:
+                if manual_choice is None:
+                    endpoint.call(action['source'], 'export', '--id', action['id'], '--package', source_package, '--expected', action['source_revision'], *options)
+            except EndpointCallError as error:
+                # Export has not written any target or pending import. A chat
+                # resumed after inspection must not block unrelated quiet chats.
+                # Do not use this rule for unknown errors or any import failure.
+                reasons = {'source_active': 'source_busy', 'source_changed': 'source_changed',
+                           'thread_missing': 'source_disappeared'}
+                if error.side != action['source'] or error.operation != 'export' or error.code not in reasons:
+                    raise
+                summary['deferred'].append({'id': action['id'], 'reason': reasons[error.code]})
+                log.info('Deferred %s: source export %s', action['id'], error.code)
+                continue
             if action['mode'] == 'full':
                 preview = endpoint.call(action['target'], 'import-preview', '--package', target_package)
                 if preview.get('compatible') is False:
                     summary['deferred'].append({'id': action['id'], 'reason': preview.get('reason', 'environment_paths_unavailable')})
+                    if manual_choice is not None:
+                        next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id']).update(
+                            status='waiting', reason=preview.get('reason', 'environment_paths_unavailable'))
                     log.info('Deferred %s: environment paths are unavailable on target', action['id'])
                     continue
             # Recheck before any existing record replacement.
             if action['target_revision'] != 'absent' and endpoint.backend_status(action['target']).get('backend_running', True):
                 log.info('Deferred existing chat %s: target backend started', action['id'])
                 summary['deferred'].append({'id': action['id'], 'reason': 'target_backend_started'})
+                if manual_choice is not None:
+                    next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id']).update(
+                        status='waiting', reason='target_backend_started')
                 continue
+            if manual_choice is not None:
+                current = {side: records(endpoint.inspect(side)).get(action['id']) for side in ('windows', 'wsl')}
+                if any(row is None or row['revision'] != manual_choice['expected'][side] for side, row in current.items()):
+                    manual_choice = {**manual_choice, 'status': 'needs_confirmation'}
+                    choice_store['choices'][action['id']] = manual_choice
+                    atomic_json(runtime / 'conflict-choices.json', choice_store)
+                    summary['deferred'].append({'id': action['id'], 'reason': 'manual_choice_stale'})
+                    next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id']).update(
+                        status='waiting', reason='manual_choice_stale')
+                    continue
+                if any(is_busy(row, config.get('quiet_seconds', 60)) for row in current.values()):
+                    summary['deferred'].append({'id': action['id'], 'reason': 'source_busy'})
+                    next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id']).update(
+                        status='waiting', reason='source_busy')
+                    continue
+                # Full native inspections can take time. A target started
+                # during them must be caught next to the pending/import step.
+                if endpoint.backend_status(action['target']).get('backend_running', True):
+                    summary['deferred'].append({'id': action['id'], 'reason': 'target_backend_started'})
+                    next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id']).update(
+                        status='waiting', reason='target_backend_started')
+                    continue
             atomic_json(journal, action)
             allow = ['--allow-existing'] if action['target_revision'] != 'absent' else []
             imported = endpoint.call(action['target'], 'import', '--package', target_package, '--expected', action['target_revision'], *options, *allow)
@@ -374,6 +536,10 @@ def execute(config, args, runtime, log, progress=None):
                 raise RuntimeError('Importer did not return its committed chat revision')
             if imported.get('revision') is not None and imported['revision'] != target_record['revision']:
                 raise RuntimeError('Importer receipt revision does not match its committed record')
+            if manual_choice is not None and (imported.get('ok') is not True or any(
+                    target_record.get(key) != states[action['source']][action['id']].get(key)
+                    for key in ('turn_count', 'item_count'))):
+                raise RuntimeError('Manual-choice import receipt does not contain the complete selected history')
             # Use the exact exported source revision, not a later source read.
             # Any messages appended during transport remain pending next run.
             source_record = states[action['source']][action['id']]
@@ -381,6 +547,16 @@ def execute(config, args, runtime, log, progress=None):
             previous = ledger['threads'].get(action['id'], {})
             ledger['threads'][action['id']] = {**rows, 'body_diverged': previous.get('body_diverged', False) if action['mode'] == 'metadata' else False}
             atomic_json(ledger_path, ledger)
+            if manual_choice is not None:
+                manual_choice = {**manual_choice, 'status': 'resolved', 'resolved_at': utc_now(),
+                                 'result_revision': target_record['revision'], 'target_backup': imported.get('backup')}
+                choice_store['choices'][action['id']] = manual_choice
+                atomic_json(runtime / 'conflict-choices.json', choice_store)
+                summary['resolved_conflicts'] += 1
+                summary['conflict_results'].append({'id': action['id'], 'source': action['source'], 'target': action['target'],
+                                                    'reason': 'manual_keep', 'choice_id': action['choice_id'],
+                                                    'backup': imported.get('backup')})
+                next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id'])['status'] = 'resolved'
             summary['transferred'] += 1
             if action.get('conflict_resolution') == 'prefer_longer':
                 summary['resolved_conflicts'] += 1
@@ -676,6 +852,9 @@ REASON_LABELS = {
     'batch_limit': '达到每轮数量上限', 'time_budget': '达到每轮时间预算',
     'target_backend_running': '目标侧 Codex 正在运行', 'target_backend_started': '目标侧 Codex 在传输前启动',
     'source_busy': '源聊天仍活跃或未静默', 'target_busy': '目标聊天仍活跃或未静默',
+    'source_changed': '源聊天在导出前后发生变化，留待下轮',
+    'source_disappeared': '源聊天在检查后消失，留待下轮检查',
+    'manual_choice_stale': '确认后聊天发生变化，请重新选择保留哪一端',
     'both_sides_changed': '两端都修改了这条聊天', 'existing_body_difference': '两端正文原本不同',
     'conflict_counts_unavailable': '冲突聊天没有可靠的轮数和内容条数',
     'conflict_counts_equal': '两端轮数和内容条数相同，保留冲突',
