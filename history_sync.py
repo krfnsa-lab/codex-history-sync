@@ -6,6 +6,7 @@ reads/writes, so live SQLite is never opened through the opposite OS mount.
 """
 import argparse
 import ctypes
+import errno
 import hashlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ import uuid
 from history_progress import ProgressWriter
 
 VERSION = 1
-SOFTWARE_VERSION = '2.2.0'
+SOFTWARE_VERSION = '2.2.1'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -387,17 +388,22 @@ def add_manual_choices(plan, views, runtime, quiet_seconds):
 def run_lock(path):
     import msvcrt
     with path.open('a+b') as stream:
-        stream.seek(0)
-        if not stream.read(1):
-            stream.write(b'0')
-            stream.flush()
+        # Windows byte-range locks also reject reads of the locked byte.
+        # Acquire first (locking beyond EOF is supported), and only then
+        # initialize an empty lock file. fstat never touches the locked byte.
         stream.seek(0)
         try:
             msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+        except OSError as error:
+            busy_errno = (errno.EACCES, errno.EAGAIN, errno.EDEADLK)
+            if error.errno not in busy_errno or getattr(error, 'winerror', None) not in (None, 33):
+                raise
             yield False
             return
         try:
+            if os.fstat(stream.fileno()).st_size == 0:
+                stream.write(b'0')
+                stream.flush()
             yield True
         finally:
             stream.seek(0)

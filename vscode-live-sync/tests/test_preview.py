@@ -1,4 +1,5 @@
 import importlib.util
+import errno
 from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
@@ -381,7 +382,7 @@ class ManualChoicePreview(unittest.TestCase):
 class BusyControllerPreview(unittest.TestCase):
     def test_running_task_prevents_scanning_or_proposing_backend_pause(self):
         fake = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=0,
-                               locking=lambda *args: (_ for _ in ()).throw(OSError('busy')))
+                               locking=lambda *args: (_ for _ in ()).throw(BlockingIOError(errno.EACCES, 'busy')))
         with tempfile.TemporaryDirectory() as folder:
             runtime = Path(folder)
             (runtime / 'ledger.json').write_text('{}')

@@ -27,7 +27,7 @@ REQUIRED_FILES = frozenset((
     "tests/test_history_endpoint_review.py", "tests/test_history_sync_review.py",
     "tests/test_prefer_longer.py", "tests/test_prefer_longer_backup.py",
     "tests/test_merge.py",
-    "tests/test_merge_chat.py", "tests/test_merge_validate.py", "tests/test_progress.py", "tests/test_endpoint_progress.py",
+    "tests/test_merge_chat.py", "tests/test_merge_validate.py", "tests/test_progress.py", "tests/test_endpoint_progress.py", "tests/test_run_lock.py",
 ))
 OPTIONAL_ROOT_FILES = frozenset(("CONTRIBUTING.md", "SECURITY.md", "VALIDATION.md"))
 LIVE_SYNC_FILES = frozenset('vscode-live-sync/' + name for name in (

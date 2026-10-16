@@ -26,6 +26,11 @@ for raw in sys.stdin:
  m=json.loads(raw);method=m.get('method');identifier=m.get('id')
  if not method:continue
  if method=='hold':held.append(identifier);continue
+ if method=='getAuthStatus' and m.get('params',{}).get('hold'):
+  held.append(identifier);continue
+ if method=='thread/read' and m.get('params',{}).get('releaseAuth'):
+  for i in held:send({'id':i,'result':{'released':True}})
+  held.clear()
  if method=='leave-descendant-and-exit':
   descendant=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   send({'id':identifier,'result':{'descendant_pid':descendant.pid}});sys.exit()
@@ -363,6 +368,49 @@ class GatewayIntegration(unittest.TestCase):
         self.response(self.send('process-finish'));self.wait(lambda:not self.status()['busy'])
         self.assertIn('error',self.response(self.send('process/spawn',{'processHandle':'failed-handle','fail':True})))
         self.wait(lambda:not self.status()['busy'])
+
+    def test_repeated_legacy_auth_status_queries_do_not_restart_idle_timer(self):
+        self.launch();self.ready()
+        self.wait(lambda:self.status()['idle_seconds']>=.12)
+        before=self.status()['idle_seconds']
+        for _ in range(5):
+            time.sleep(.04)
+            self.assertIn('result',self.response(self.send('getAuthStatus')))
+            self.assertFalse(self.status()['busy'])
+        self.assertGreaterEqual(self.status()['idle_seconds'],before+.15)
+        self.global_pause()
+        self.assertTrue(self.control('prepare_pause',minimum_idle_seconds=before+.15)['ok'])
+
+    def test_inflight_legacy_auth_query_remains_busy_until_its_response(self):
+        self.launch();self.ready()
+        self.wait(lambda:self.status()['idle_seconds']>=.12)
+        before=self.status()['idle_seconds']
+        auth=self.send('getAuthStatus',{'hold':True})
+        self.wait(lambda:self.status()['pending_request_count']==1)
+        self.global_pause()
+        self.assertEqual(self.control('prepare_pause')['error'],'busy')
+        self.assertTrue(self.status()['child_running'])
+        released=self.send('thread/read',{'releaseAuth':True})
+        self.assertTrue(self.response(auth)['result']['released'])
+        self.response(released)
+        self.wait(lambda:not self.status()['busy'])
+        self.assertGreaterEqual(self.status()['idle_seconds'],before)
+        self.assertTrue(self.control('prepare_pause',minimum_idle_seconds=before)['ok'])
+
+    def test_legacy_auth_poll_cannot_clear_turn_or_unknown_write_activity(self):
+        self.launch();self.ready();self.global_pause()
+        self.response(self.send('turn/start',{'threadId':'synthetic'}))
+        self.response(self.send('getAuthStatus'))
+        self.assertGreater(self.status()['active_turn_count'],0)
+        self.assertEqual(self.control('prepare_pause')['error'],'busy')
+        self.response(self.send('finish'))
+        self.wait(lambda:not self.status()['busy'] and self.status()['idle_seconds']>=.12)
+        before=self.status()['idle_seconds']
+        self.response(self.send('synthetic/write'))
+        self.assertLess(self.status()['idle_seconds'],before)
+        self.response(self.send('getAuthStatus'))
+        self.assertEqual(self.control('prepare_pause',minimum_idle_seconds=60)['error'],'recent_activity')
+        self.assertTrue(self.status()['child_running'])
 
     def test_stored_thread_idle_response_never_overrides_observed_live_turn(self):
         self.launch();self.ready();self.global_pause()

@@ -576,3 +576,65 @@ test('progress-path mode is read-only and request identities are passed as exact
   const second = (await fs.readFile(capture, 'utf8')).trim().split('\n'); assert.deepEqual(second.slice(-2), ['--progress-request-id', id]);
   await assert.rejects(runWindows(config, true, '------------------------------------'), /Invalid progress request/);
 });
+
+
+test('verified short idle duration is reported distinctly from a genuinely active request', async t => {
+  for (const idle_seconds of [0, 25.9, 59.99]) {
+    const f = await fixture(t, { request: async (_, action) => {
+      f.calls.push(action); return { ok: true, state: { ...healthyRecoveryState, idle_seconds } };
+    } });
+    const result = await f.coordinator.check();
+    assert.equal(result.reason, 'codex_busy'); assert.equal(result.idle_seconds, Math.floor(idle_seconds));
+    assert.equal(result.busy_activity, undefined);
+    assert.match(describeResult(result).detail, new RegExp(`后端已空闲 ${Math.floor(idle_seconds)}/60 秒`));
+    assert.doesNotMatch(describeResult(result).detail, /仍有请求或任务正在运行/);
+    assert.ok(!f.calls.includes('prepare_pause')); assert.ok(!f.calls.includes('reload'));
+  }
+  for (const active of [{ busy: true }, { pending_request_count: 1 }, { server_request_count: 1 },
+    { active_turn_count: 1 }, { known_activity_count: 1 }]) {
+    const f = await fixture(t, { request: async () => ({ ok: true, state: { ...healthyRecoveryState, idle_seconds: 25, ...active } }) });
+    const result = await f.coordinator.check();
+    assert.equal(result.reason, 'codex_busy'); assert.equal(result.idle_seconds, undefined); assert.equal(result.busy_activity, true);
+    assert.match(describeResult(result).detail, /仍有请求或任务正在运行/); assert.doesNotMatch(describeResult(result).detail, /已空闲/);
+    assert.ok(!f.calls.includes('sync')); assert.ok(!f.calls.includes('reload'));
+  }
+});
+
+test('unknown or unhealthy gateway fields never claim a verified idle duration', async t => {
+  const invalid = [{ ok: false }, { state: null }, ...[
+    { busy: undefined }, { starting: true }, { paused: true }, { child_running: false }, { shutdown_failed: true },
+    { child_pid: undefined }, { pending_request_count: undefined }, { server_request_count: -1 },
+    { active_turn_count: '0' }, { known_activity_count: null }, { idle_seconds: -1 }, { idle_seconds: NaN },
+    { idle_seconds: undefined }
+  ].map(changed => ({ state: { ...healthyRecoveryState, idle_seconds: 25, ...changed } }))];
+  for (const changed of invalid) {
+    const f = await fixture(t, { request: async () => ({ ok: true, state: { ...healthyRecoveryState, idle_seconds: 25 }, ...changed }) });
+    const result = await f.coordinator.check();
+    assert.equal(result.reason, 'codex_busy'); assert.equal(result.idle_seconds, undefined); assert.equal(result.busy_activity, undefined);
+    assert.doesNotMatch(describeResult(result).detail, /已空闲 \d+\/60 秒|仍有请求或任务正在运行/);
+    assert.ok(!f.calls.includes('sync')); assert.ok(!f.calls.includes('reload'));
+  }
+});
+
+test('recovery diagnostics retain the same verified-idle and active-task distinction without weakening guards', async t => {
+  for (const changes of [{ idle_seconds: 17.8 }, { busy: true, idle_seconds: 17.8 }, { known_activity_count: undefined, idle_seconds: 17.8 }]) {
+    const f = await fixture(t, { request: async () => ({ ok: true, state: { ...healthyRecoveryState, ...changes } }) });
+    const result = await f.coordinator.recover();
+    assert.equal(result.reason, 'codex_busy');
+    if (changes.busy) { assert.equal(result.busy_activity, true); assert.equal(result.idle_seconds, undefined); }
+    else if (changes.known_activity_count === undefined && Object.hasOwn(changes, 'known_activity_count')) {
+      assert.equal(result.idle_seconds, undefined); assert.equal(result.busy_activity, undefined);
+    } else assert.equal(result.idle_seconds, 17);
+    assert.ok(!f.calls.includes('prepare_pause')); assert.ok(!f.calls.includes('recovery')); assert.ok(!f.calls.includes('reload'));
+  }
+});
+
+test('idle-wait presentation is bounded and never invents idle time from malformed metadata', () => {
+  const idle = describeResult({ kind: 'waiting', reason: 'codex_busy', idle_seconds: 25.8 });
+  assert.match(idle.detail, /后端已空闲 25\/60 秒，等待安全同步/); assert.doesNotMatch(idle.text, /25\/60/);
+  assert.match(describeResult({ kind: 'waiting', reason: 'codex_busy', busy_activity: true, idle_seconds: 25 }).detail, /仍有请求或任务正在运行/);
+  for (const idle_seconds of [undefined, null, -1, 60, Infinity, NaN, 'private/path']) {
+    const result = describeResult({ kind: 'waiting', reason: 'codex_busy', idle_seconds });
+    assert.doesNotMatch(result.detail, /后端已空闲|private\/path/); assert.doesNotMatch(result.text, /\$\(check\)/);
+  }
+});

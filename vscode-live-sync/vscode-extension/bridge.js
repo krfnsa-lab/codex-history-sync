@@ -161,6 +161,20 @@ function previewResult(preview) {
   return { kind, reason, preview };
 }
 
+// Diagnostic metadata is emitted only from a fully known running backend.
+// It never changes the existing admission checks below.
+function gatewayWaitDetails(reply) {
+  const state = reply?.state;
+  const counts = ['pending_request_count', 'server_request_count', 'active_turn_count', 'known_activity_count'];
+  if (reply?.ok !== true || !state || state.child_running !== true || state.paused !== false ||
+      state.shutdown_failed !== false || state.starting !== false ||
+      !Number.isInteger(state.child_pid) || state.child_pid <= 0 || typeof state.busy !== 'boolean' ||
+      counts.some(key => !Number.isSafeInteger(state[key]) || state[key] < 0)) return {};
+  if (state.busy || counts.some(key => state[key] > 0)) return { busy_activity: true };
+  return Number.isFinite(state.idle_seconds) && state.idle_seconds >= 0 && state.idle_seconds < 60
+    ? { idle_seconds: Math.floor(state.idle_seconds) } : {};
+}
+
 function describeResult(result) {
   const reasons = {
     chat_conflict: '同一聊天两端均有修改，或原有正文不同。已保留两端记录，未自动覆盖；需要检查冲突。',
@@ -229,11 +243,16 @@ function describeResult(result) {
   const diagnostics = Object.entries(result.preview?.blocked_reason_counts || {})
     .filter(([key, count]) => /^[a-z_]+$/.test(key) && Number.isInteger(count) && count > 0)
     .map(([key, count]) => `${key}：${count}`).join('；');
+  const codexWait = result.reason === 'codex_busy'
+    ? result.busy_activity === true ? 'Codex 仍有请求或任务正在运行，此次未同步。'
+      : Number.isFinite(result.idle_seconds) && result.idle_seconds >= 0 && result.idle_seconds < 60
+      ? `后端已空闲 ${Math.floor(result.idle_seconds)}/60 秒，等待安全同步。此次未同步。` : reasons.codex_busy
+    : undefined;
   const explanation = stale ? reasons.manual_choice_stale
     : incompatible ? '聊天工作目录无法映射到目标系统中存在的目录。未替换聊天，请检查工作目录兼容性。'
     : result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
     ? '两端聊天数量相同、无法可靠比较，或尚未建立可用基线。已保留两端，未自动选择版本。'
-    : reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
+    : codexWait || reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
   return { text: selectedText, detail: explanation + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
     warning: ['conflict', 'blocked'].includes(result.kind) };
 }
@@ -269,13 +288,14 @@ class Coordinator {
     if (this.running) return { kind: 'waiting', reason: 'check_running' };
     this.running = true;
     const pauseFile = path.join(this.config.stateDir, 'pause.json');
-    let recoveryChildPid;
+    let recoveryChildPid; let recoveryWaitDetails = {};
     const hasPause = async () => {
       try { await fs.lstat(pauseFile); return true; }
       catch (error) { if (error.code === 'ENOENT') return false; throw error; }
     };
     const health = async instance => {
       const reply = await this.request(instance, 'status');
+      recoveryWaitDetails = gatewayWaitDetails(reply);
       const state = reply?.state;
       if (!reply?.ok || !state || state.child_running !== true || state.paused !== false ||
           state.shutdown_failed !== false || state.starting !== false ||
@@ -295,14 +315,14 @@ class Coordinator {
       if (instances.length !== 1) return { kind: 'waiting', reason: 'multiple_windows' };
       if (instances[0].parent_pid !== process.pid) return { kind: 'waiting', reason: 'other_window' };
       const first = await health(instances[0]);
-      if (first) return { kind: 'waiting', reason: first };
+      if (first) return { kind: 'waiting', reason: first, ...recoveryWaitDetails };
       if ((await this.callWindows('recovery'))?.safe_to_reload !== true) {
         return { kind: 'blocked', reason: 'recovery_pending' };
       }
       if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
       if (!sameInstances(instances, await this.discover(this.config.stateDir))) return { kind: 'waiting', reason: 'instances_changed' };
       const final = await health(instances[0]);
-      if (final) return { kind: 'waiting', reason: final };
+      if (final) return { kind: 'waiting', reason: final, ...recoveryWaitDetails };
       if (await hasPause()) return { kind: 'blocked', reason: 'existing_pause' };
       return { kind: 'recovered', reason: 'recovery_verified' };
     } finally { this.running = false; }
@@ -336,7 +356,7 @@ class Coordinator {
         if (status.ok !== true || !state || state.busy !== false || state.starting !== false || state.paused !== false ||
             state.child_running !== true || state.shutdown_failed !== false || !Number.isInteger(state.child_pid) || state.child_pid <= 0 ||
             ['pending_request_count', 'server_request_count', 'active_turn_count', 'known_activity_count'].some(key => state[key] !== 0) ||
-            !Number.isFinite(state.idle_seconds) || state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview };
+            !Number.isFinite(state.idle_seconds) || state.idle_seconds < 60) return { kind: 'waiting', reason: 'codex_busy', preview, ...gatewayWaitDetails(status) };
       }
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       this.progress('confirming');

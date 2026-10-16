@@ -28,6 +28,7 @@ READ_ONLY_METHODS = {
     "app/list", "app/installed", "skills/list", "hooks/list", "mcpServerStatus/list",
     "project/list", "project/read", "threadSection/list", "permissionProfile/list",
     "experimentalFeature/list", "remoteControl/status/read", "server/diagnostics",
+    "getAuthStatus",
 }
 
 

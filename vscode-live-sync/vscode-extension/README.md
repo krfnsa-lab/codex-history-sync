@@ -1,6 +1,10 @@
-# Codex History Sync 1.1.0
+# Codex History Sync 1.1.1
 
-Optional Remote WSL companion for Codex History Sync 2.2.0. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+Optional Remote WSL companion for Codex History Sync 2.2.1. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+
+Version 1.1.1 stops completed background authentication-status polls from resetting the idle timer. Outstanding requests remain busy, and active turns, tools and unknown mutating requests still prevent pausing. A competing synchronization lock now produces a normal deferral rather than a locked-byte read error; genuine file-access failures still propagate.
+
+When the only missing condition is idle time, a manual check shows the verified elapsed idle seconds against the 60-second threshold. Pending work and incomplete state are reported separately; the message does not bypass admission checks.
 
 The default reloadMode=confirm only previews in the background. A ready update is applied after the user clicks the status and confirms that unsent drafts are saved. Automatic reload is opt-in and requires acceptance through VS Code APIs. The official Codex composer exposes no draft-inspection API; the companion does not promise draft preservation in automatic mode.
 
