@@ -157,6 +157,16 @@ class GatewayIntegration(unittest.TestCase):
         self.state_dir.mkdir(parents=True,exist_ok=True)
         (self.state_dir/'pause.json').write_text(json.dumps({'nonce':'synthetic-pause'}))
 
+    def assert_request_restarted_idle(self, method, params=None):
+        # Request delivery and reading its response/status can be arbitrarily
+        # delayed by a busy runner. A reset must still fall after this boundary;
+        # comparing with a previous idle duration assumes a fast round trip.
+        sent=time.monotonic()
+        self.response(self.send(method,params))
+        state=self.status()
+        self.assertLessEqual(state['idle_seconds'],time.monotonic()-sent+.02)
+        return state
+
     def test_passthrough_error_and_private_state(self):
         self.launch();self.ready()
         marker='synthetic-body-not-in-state'
@@ -357,7 +367,7 @@ class GatewayIntegration(unittest.TestCase):
         time.sleep(.12);before=self.status()['idle_seconds']
         self.response(self.send('thread/read',{'threadId':'synthetic'}))
         self.assertGreaterEqual(self.status()['idle_seconds'],before)
-        self.response(self.send('echo'));self.assertLess(self.status()['idle_seconds'],before)
+        self.assert_request_restarted_idle('echo')
         self.assertEqual(self.control('prepare_pause',minimum_idle_seconds=True)['error'],'recent_activity')
 
     def test_failed_duplicate_spawn_does_not_hide_existing_process(self):
@@ -405,12 +415,30 @@ class GatewayIntegration(unittest.TestCase):
         self.assertEqual(self.control('prepare_pause')['error'],'busy')
         self.response(self.send('finish'))
         self.wait(lambda:not self.status()['busy'] and self.status()['idle_seconds']>=.12)
-        before=self.status()['idle_seconds']
-        self.response(self.send('synthetic/write'))
-        self.assertLess(self.status()['idle_seconds'],before)
+        self.assert_request_restarted_idle('synthetic/write')
         self.response(self.send('getAuthStatus'))
         self.assertEqual(self.control('prepare_pause',minimum_idle_seconds=60)['error'],'recent_activity')
         self.assertTrue(self.status()['child_running'])
+
+    def test_idle_reset_assertion_tolerates_delayed_reads_but_rejects_no_reset(self):
+        self.launch();self.ready()
+        self.wait(lambda:self.status()['idle_seconds']>=.12)
+        response,status=self.response,self.status
+        def delayed_response(identifier):
+            result=response(identifier)
+            time.sleep(.2)
+            return result
+        def delayed_status():
+            time.sleep(.2)
+            return status()
+        with mock.patch.object(self,'response',side_effect=delayed_response), \
+                mock.patch.object(self,'status',side_effect=delayed_status):
+            state=self.assert_request_restarted_idle('echo')
+            self.assertGreaterEqual(state['idle_seconds'],.2)
+            # An actual read-only round trip leaves the earlier timestamp in
+            # place, so the same boundary assertion must fail despite delays.
+            with self.assertRaises(AssertionError):
+                self.assert_request_restarted_idle('thread/read',{'threadId':'synthetic'})
 
     def test_stored_thread_idle_response_never_overrides_observed_live_turn(self):
         self.launch();self.ready();self.global_pause()
