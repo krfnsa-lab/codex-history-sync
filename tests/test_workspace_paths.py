@@ -415,7 +415,30 @@ class WorkspaceImportTests(unittest.TestCase):
                 with mock.patch.object(ep, "workspace_root_exists", return_value=True):
                     with self.assertRaises(ep.EndpointError) as error:
                         ep.rewrite_transcript_environment(source, destination, platform="linux")
-                self.assertEqual(error.exception.code, "environment_record_too_large")
+                self.assertEqual(error.exception.code, "transcript_header_unsupported" if unfamiliar_layout else "environment_record_too_large")
+
+    def test_large_ordinal_compaction_import_roundtrip_keeps_body_and_projection(self):
+        large = line({'timestamp': '2026-10-16T00:00:00Z', 'ordinal': 1257, 'type': 'compacted',
+                      'payload': {'message': 'A' * (ep.MAX_ENVIRONMENT_RECORD_BYTES + 1024),
+                                  'replacement_history': [{'type': 'message', 'content': [
+                                      {'type': 'input_text', 'text': r'keep C:\code and workspace_roots'}]}]}}, b'\r\n')
+        self.lines[2] = large
+        self.set_transcript(self.source, self.lines)
+        self.export_from()
+        with mock.patch.object(ep, 'native_platform', return_value='linux'), \
+                mock.patch.object(ep, 'workspace_root_exists', return_value=True):
+            self.assertTrue(ep.import_preview(self.args(self.target, self.package))['compatible'])
+        imported = self.import_to()
+        self.assertEqual(self.target_lines()[2], large)
+        self.assertEqual(imported['record']['item_count'], ep.read_revision(self.source, ID)['item_count'])
+        # Export the mapped Linux copy and return it to a new native Windows
+        # fixture. This exercises both offset translations, not just headers.
+        self.package = self.root / 'compacted-return'
+        self.export_from(home=self.target, platform='linux')
+        returned = fixture(self.root / 'returned', with_chat=False, extra_column=True)
+        self.import_to(home=returned, platform='windows')
+        self.assertEqual(self.target_lines(returned)[2], large)
+        self.assertEqual(ep.read_revision(returned, ID)['item_count'], imported['record']['item_count'])
 
     def test_import_preview_is_read_only_and_reports_mapped_environment(self):
         self.export_from()

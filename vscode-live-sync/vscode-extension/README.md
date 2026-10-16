@@ -1,6 +1,8 @@
-# Codex History Sync 1.1.1
+# Codex History Sync 1.1.2
 
-Optional Remote WSL companion for Codex History Sync 2.2.1. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+Optional Remote WSL companion for Codex History Sync 2.2.2. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+
+Version 1.1.2 handles large ordinary records with ordinal or other complete header metadata without rewriting message bytes. Manual retry bypasses only the time delay; automatic backoff retains allowlisted failure counts, while all activity, confirmation and import guards remain in force.
 
 Version 1.1.1 stops completed background authentication-status polls from resetting the idle timer. Outstanding requests remain busy, and active turns, tools and unknown mutating requests still prevent pausing. A competing synchronization lock now produces a normal deferral rather than a locked-byte read error; genuine file-access failures still propagate.
 

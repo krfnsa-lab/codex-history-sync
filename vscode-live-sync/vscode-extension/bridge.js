@@ -175,6 +175,34 @@ function gatewayWaitDetails(reply) {
     ? { idle_seconds: Math.floor(state.idle_seconds) } : {};
 }
 
+const deferredReasons = {
+  environment_record_too_large: '记录头或环境记录超出安全解析范围，需要检查格式兼容性',
+  transcript_header_unsupported: '大记录头部格式尚不支持，需要更新兼容处理',
+  transcript_record_too_large: '正文记录超出当前支持范围',
+  incomplete_transcript: '正文尚未写入完整', invalid_transcript: '正文格式无法安全读取',
+  invalid_environment: '聊天环境记录格式无法安全读取', invalid_workspace_roots: '工作目录列表格式异常',
+  workspace_cwd_unmappable: '工作目录无法映射到目标系统', environment_paths_unavailable: '目标工作目录不可用',
+  source_busy: '来源聊天正在使用', source_changed: '来源版本在检查后发生变化',
+  source_disappeared: '来源记录已不存在', target_backend_started: '目标后端在同步前重新启动',
+  manual_choice_stale: '已选版本发生变化，需要重新确认', other: '其他条件未通过，请查看同步详情'
+};
+function safeDeferredCounts(value) {
+  const counts = {};
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [reason, count] of Object.entries(value)) {
+      if (Object.hasOwn(deferredReasons, reason) && Number.isSafeInteger(count) && count > 0) counts[reason] = count;
+    }
+  }
+  return counts;
+}
+function deferredCounts(result) {
+  const counts = {};
+  for (const item of Array.isArray(result?.deferred) ? result.deferred : []) {
+    const reason = Object.hasOwn(deferredReasons, item?.reason) ? item.reason : 'other';
+    counts[reason] = (counts[reason] || 0) + 1;
+  }
+  return counts;
+}
 function describeResult(result) {
   const reasons = {
     chat_conflict: '同一聊天两端均有修改，或原有正文不同。已保留两端记录，未自动覆盖；需要检查冲突。',
@@ -186,7 +214,7 @@ function describeResult(result) {
     check_running: '已有同步检查正在进行，请等待本轮结束。',
     reload_confirmation: '有新记录待同步。请点击此状态，确认聊天输入框中的草稿已发送或保存后同步并重载窗口。',
     sync_disabled: '同步设置已变更或自动同步已停用，本轮未继续导入。',
-    retry_backoff: '上次未传输记录，正在等待重试时间。此次没有同步。',
+    retry_backoff: '上次未传输记录，正在等待自动重试。可点击状态栏手动重新检查。',
     other_native_backends: '检测到其他独立或无法确认归属的 Codex 进程，同步暂缓。这不一定表示打开了多个 VS Code 窗口。',
     multiple_windows: '检测到多个同步桥窗口，此次未同步。请只保留一个 WSL Codex 窗口。',
     other_window: '同步桥属于另一个 VS Code 窗口，此次未同步。请在该窗口触发检查。',
@@ -196,7 +224,7 @@ function describeResult(result) {
     gateway_unhealthy: '同步桥尚未恢复正常运行，自动同步仍暂停。请检查 Codex 连接状态。',
     instances_changed: 'Codex 窗口发生变化，此次未同步，稍后会重试。',
     controller_running: '定时同步正在执行，此次未重复传输。',
-    zero_transfers: '同步器本轮没有传输记录，已恢复 Codex，稍后会重新检查。',
+    zero_transfers: '同步器本轮没有传输记录，尚未同步。',
     native_sync_can_run: '当前未连接 Codex 后端，请等待定时同步或运行基础同步脚本。',
     new_chats_pending: '有新聊天待导入；当前窗口自动补齐只处理已有聊天，请通过基础同步导入。',
     opposite_direction_pending: '有 WSL → Windows 更新待同步；请等待 Windows Codex 空闲并停止后端后使用基础同步。',
@@ -248,12 +276,16 @@ function describeResult(result) {
       : Number.isFinite(result.idle_seconds) && result.idle_seconds >= 0 && result.idle_seconds < 60
       ? `后端已空闲 ${Math.floor(result.idle_seconds)}/60 秒，等待安全同步。此次未同步。` : reasons.codex_busy
     : undefined;
+  const failedCounts = safeDeferredCounts(result.deferred_reason_counts || deferredCounts(result.result));
+  const deferredDetail = Object.entries(failedCounts).map(([key, count]) => `${deferredReasons[key]}：${count} 条`).join('；');
+  const retryDetail = result.reason === 'retry_backoff' && Number.isSafeInteger(result.retry_after_seconds) && result.retry_after_seconds > 0
+    ? `自动重试还需约 ${result.retry_after_seconds} 秒。` : '';
   const explanation = stale ? reasons.manual_choice_stale
     : incompatible ? '聊天工作目录无法映射到目标系统中存在的目录。未替换聊天，请检查工作目录兼容性。'
     : result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
     ? '两端聊天数量相同、无法可靠比较，或尚未建立可用基线。已保留两端，未自动选择版本。'
     : codexWait || reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
-  return { text: selectedText, detail: explanation + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
+  return { text: selectedText, detail: explanation + retryDetail + (deferredDetail ? `\n上次未同步原因：${deferredDetail}。` : '') + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
     warning: ['conflict', 'blocked'].includes(result.kind) };
 }
 
@@ -271,6 +303,7 @@ class Coordinator {
     this.onFailure = dependencies.onFailure || (() => Promise.resolve());
     this.onDeferred = dependencies.onDeferred || (() => Promise.resolve());
     this.nextAttemptAt = dependencies.nextAttemptAt || (() => 0);
+    this.retryDetails = dependencies.retryDetails || (() => ({}));
     this.onProgress = dependencies.onProgress || (() => {});
   }
 
@@ -336,7 +369,11 @@ class Coordinator {
     try {
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled' };
       if (!this.canReload()) return { kind: 'waiting', reason: this.reloadBlockReason() };
-      if (Date.now() < this.nextAttemptAt()) return { kind: 'waiting', reason: 'retry_backoff' };
+      const now = Date.now(); const nextAttempt = this.nextAttemptAt();
+      if (options.manual !== true && Number.isFinite(nextAttempt) && now < nextAttempt) {
+        return { kind: 'waiting', reason: 'retry_backoff', retry_after_seconds: Math.ceil((nextAttempt - now) / 1000),
+          deferred_reason_counts: safeDeferredCounts(this.retryDetails()) };
+      }
       const preview = await this.callWindows(true);
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
       if (preview.eligible !== true || !Array.isArray(preview.candidate_ids) || preview.candidate_ids.length === 0) return previewResult(preview);
@@ -396,9 +433,12 @@ class Coordinator {
       const result = await this.callWindows(false);
       if (result.status !== 'completed' && result.status !== 'skipped_already_running') throw new Error('The synchronizer needs review before another update.');
       if (result.status === 'skipped_already_running' || !Number.isInteger(result.transferred) || result.transferred < 1) {
-        await this.onDeferred(Date.now() + 300000);
-        return { kind: 'waiting', reason: result.status === 'skipped_already_running' ? 'controller_running' : 'zero_transfers', result, preview };
+        const reasons = deferredCounts(result);
+        await this.onDeferred(Date.now() + 300000, reasons);
+        return { kind: 'waiting', reason: result.status === 'skipped_already_running' ? 'controller_running' : 'zero_transfers',
+          deferred_reason_counts: reasons, result, preview };
       }
+      try { await this.onDeferred(0, {}); } catch { /* Optional retry storage cannot invalidate a committed transfer. */ }
       return { kind: 'synced', result, preview };
     } catch (error) {
       operationFailed = true;

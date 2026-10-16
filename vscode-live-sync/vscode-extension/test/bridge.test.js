@@ -296,6 +296,45 @@ test('more than one instance waits without touching them', async t => {
   assert.deepEqual(f.calls, ['preview']);
 });
 
+test('manual retry bypasses only the clock delay and retains confirmation and busy guards', async t => {
+  const f = await fixture(t, { nextAttemptAt: () => Date.now() + 300000,
+    confirmReload: async () => false });
+  assert.equal((await f.coordinator.check()).reason, 'retry_backoff');
+  assert.deepEqual(f.calls, []);
+  assert.equal((await f.coordinator.check({ manual: true })).reason, 'reload_confirmation');
+  assert.equal(f.calls.includes('prepare_pause'), false);
+  const busy = await fixture(t, { nextAttemptAt: () => Date.now() + 300000,
+    request: async () => ({ ok: true, state: { ...healthyRecoveryState, busy: true } }) });
+  assert.equal((await busy.coordinator.check({ manual: true })).reason, 'codex_busy');
+  assert.equal(busy.calls.includes('sync'), false);
+});
+
+test('zero-transfer reason survives automatic retry without retaining arbitrary server text', async t => {
+  let until = 0; let saved = {};
+  const f = await fixture(t, { nextAttemptAt: () => until, retryDetails: () => saved,
+    onDeferred: async (value, counts) => { until = value; saved = counts; } });
+  const run = f.coordinator.runWindows;
+  f.coordinator.runWindows = (config, mode) => mode === false ? Promise.resolve({ status: 'completed', transferred: 0,
+    deferred: [{ reason: 'environment_record_too_large', id: 'private-chat' }, { reason: 'private-server-text' }] }) : run(config, mode);
+  const zero = await f.coordinator.check({ manual: true });
+  assert.equal(zero.reason, 'zero_transfers');
+  assert.deepEqual(saved, { environment_record_too_large: 1, other: 1 });
+  const delayed = await f.coordinator.check();
+  assert.equal(delayed.reason, 'retry_backoff');
+  assert.ok(delayed.retry_after_seconds > 0 && delayed.retry_after_seconds <= 300);
+  const text = describeResult(delayed).detail;
+  assert.match(text, /格式兼容性/);
+  assert.match(text, /手动重新检查/);
+  assert.doesNotMatch(text, /private-server-text|private-chat/);
+});
+
+test('retry diagnostics cannot turn a committed transfer into failure', async t => {
+  const f = await fixture(t, { onDeferred: async () => { throw new Error('storage failure'); } });
+  assert.equal((await f.coordinator.check({ manual: true })).kind, 'synced');
+  assert.equal(f.calls.includes('disable-review'), false);
+  assert.equal(f.calls.includes('reload'), true);
+});
+
 test('busy status cannot import or reload', async t => {
   const f = await fixture(t, { request: async () => ({ ok: true, state: { busy: true } }) });
   assert.equal((await f.coordinator.check()).kind, 'waiting');

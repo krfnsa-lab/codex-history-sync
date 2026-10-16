@@ -377,7 +377,11 @@ function configure(initialCheck = true) {
       canReload,
       reloadBlockReason,
       nextAttemptAt: () => extensionContext.globalState.get('nextAttemptAt', 0),
-      onDeferred: value => extensionContext.globalState.update('nextAttemptAt', value),
+      retryDetails: () => extensionContext.globalState.get('lastDeferredReasonCounts', {}),
+      onDeferred: async (value, reasons) => {
+        await extensionContext.globalState.update('lastDeferredReasonCounts', reasons);
+        await extensionContext.globalState.update('nextAttemptAt', value);
+      },
       reload: () => vscode.commands.executeCommand('workbench.action.reloadWindow'),
       onFailure: async error => {
         await extensionContext.globalState.update('reviewError', failureMessage(error));

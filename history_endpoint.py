@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import ctypes
+import codecs
 import contextvars
 import functools
 import hashlib
@@ -1021,17 +1022,63 @@ def rewrite_environment_line(line, platform):
     return line, summary
 
 
+def transcript_header_kind(prefix):
+    """Read only complete top-level header values from a bounded prefix.
+
+    Native records can add metadata such as ordinal before type. A regex tied
+    to one field order confuses those ordinary records with environment data.
+    Decoding complete header values also prevents a nested payload type from
+    masquerading as the outer record type. Unknown/oversized headers retain
+    the ordinary bounded fallback below; message bodies are never rewritten.
+    """
+    try:
+        text = codecs.getincrementaldecoder('utf-8')().decode(prefix, final=False)
+        decoder = json.JSONDecoder()
+        whitespace = re.compile(r'[ \t\r\n]*')
+        position = whitespace.match(text).end()
+        if position >= len(text) or text[position] != '{':
+            return None
+        position += 1
+        kind = None
+        seen = set()
+        while position < len(text):
+            position = whitespace.match(text, position).end()
+            key, position = decoder.raw_decode(text, position)
+            if not isinstance(key, str) or key in seen:
+                return None
+            seen.add(key)
+            position = whitespace.match(text, position).end()
+            if position >= len(text) or text[position] != ':':
+                return None
+            position = whitespace.match(text, position + 1).end()
+            if key == 'payload':
+                return kind
+            value, position = decoder.raw_decode(text, position)
+            if key == 'type':
+                if not isinstance(value, str) or not value:
+                    return None
+                kind = value
+            position = whitespace.match(text, position).end()
+            if position >= len(text):
+                return None
+            if text[position] == '}':
+                return kind
+            if text[position] != ',':
+                return None
+            position += 1
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    return None
+
+
 def transcript_environment_chunks(stream, platform):
     """Bound buffers for large message/image records, retaining their bytes.
 
-    Native Codex writes the type before the payload. A long ordinary record
-    with that unambiguous header can pass through in chunks; environment or
+    Native Codex writes a top-level type before the payload, with optional
+    header metadata. A long ordinary record with that unambiguous header
+    can pass through in chunks; environment or
     unfamiliar layouts are limited before attempting a full JSON decode.
     """
-    ordinary_header = re.compile(
-        rb'^\s*\{\s*(?:"timestamp"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*)?'
-        rb'"type"\s*:\s*"([^"\\]+)"\s*[,}]'
-    )
     while True:
         initial = stream.readline(CHUNK_SIZE)
         progress_heartbeat()
@@ -1041,8 +1088,8 @@ def transcript_environment_chunks(stream, platform):
             rewritten, counts = rewrite_environment_line(initial, platform)
             yield initial, rewritten, counts
             continue
-        kind = ordinary_header.match(initial)
-        if kind is not None and kind.group(1) not in (b"session_meta", b"turn_context"):
+        kind = transcript_header_kind(initial)
+        if kind is not None and kind not in ("session_meta", "turn_context"):
             yield initial, initial, environment_path_summary()
             while True:
                 chunk = stream.readline(CHUNK_SIZE)
@@ -1057,6 +1104,8 @@ def transcript_environment_chunks(stream, platform):
         while not record.endswith(b"\n"):
             remaining = MAX_ENVIRONMENT_RECORD_BYTES - len(record)
             if remaining <= 0:
+                if kind is None:
+                    fail("transcript_header_unsupported", "Large transcript record has an unsupported header layout")
                 fail("environment_record_too_large", "Environment record exceeds the safe JSON decode limit")
             chunk = stream.readline(min(CHUNK_SIZE, remaining))
             progress_heartbeat()
@@ -1305,7 +1354,7 @@ def import_preview(args):
         fail("out_of_scope", "Package chat is outside the configured scope")
     compatible_errors = {"workspace_cwd_unmappable", "invalid_cwd", "invalid_transcript",
                          "invalid_environment", "invalid_workspace_roots", "environment_record_too_large",
-                         "transcript_record_too_large", "incomplete_transcript"}
+                         "transcript_record_too_large", "transcript_header_unsupported", "incomplete_transcript"}
     try:
         mapped_cwd = local_environment_cwd(imported.get("cwd", ""))
         summary = inspect_workspace_environment(package / "transcript.jsonl")
