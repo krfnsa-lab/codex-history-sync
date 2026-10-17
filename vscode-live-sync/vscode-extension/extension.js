@@ -401,6 +401,12 @@ function configure(initialCheck = true) {
 
 function activate(context) {
   extensionContext = context;
+  // Record activation, not installation, so an old host cannot be mistaken for
+  // the newly installed frontend. This is bounded local extension state.
+  try {
+    const version = context.extension?.packageJSON?.version;
+    if (typeof version === 'string') Promise.resolve(context.globalState.update('loadedExtensionVersion', version)).catch(() => {});
+  } catch { /* Diagnostics cannot change activation. */ }
   bootstrapGateway(context);
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 10);
   status.command = 'codexHistoryLiveSync.checkNow';

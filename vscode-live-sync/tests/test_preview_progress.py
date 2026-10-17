@@ -211,6 +211,25 @@ class PreviewProgressTests(unittest.TestCase):
         ack.assert_not_called()
         self.assertEqual((self.runtime / 'progress.json').read_bytes(), original)
 
+    def test_outgoing_sync_skips_wsl_acknowledgement_and_passes_strict_scope(self):
+        self.sync.restrict_outgoing_plan = Mock()
+        def execute(config,args,runtime,log):
+            self.assertTrue(self.held)
+            self.assertIs(args.outgoing_only,True)
+            return {'status':'completed','transferred':1,'planned_transfers':1,'outgoing_only':True}
+        self.sync.execute=execute
+        self.sync.save_run_report=Mock()
+        with self.harness(), patch.object(preview,'acknowledge_local_settings',side_effect=AssertionError('WSL must stay open')) as ack:
+            result=preview.sync_once(self.controller,self.controller,self.request_id,outgoing_only=True)
+        ack.assert_not_called()
+        self.assertEqual(result['local_settings_acknowledged'],0)
+        self.assertTrue(result['outgoing_only'])
+        self.assertFalse(self.held)
+
+    def test_outgoing_sync_rejects_controller_without_direction_scope(self):
+        with self.harness(), self.assertRaises(RuntimeError):
+            preview.sync_once(self.controller,self.controller,self.request_id,outgoing_only=True)
+
     def test_sync_once_ack_failure_reports_error_and_never_executes(self):
         self.sync.execute = Mock(side_effect=AssertionError('must not import'))
         with self.harness(), patch.object(preview, 'acknowledge_local_settings', side_effect=OSError('private-error')):

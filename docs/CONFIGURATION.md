@@ -15,12 +15,24 @@
 | `interval_minutes` | 检查间隔，默认 5 分钟 |
 | `quiet_seconds` | 聊天至少静默多少秒，默认 60 |
 | `conflict_resolution` | 默认 `manual`，保留冲突；`prefer_longer` 自动选择轮数更多的一端，轮数相同再比较内容条目数 |
+| `auto_exit_windows_for_wsl_choices` | 默认 `false`；手动选定 WSL 版本的冲突等待目标后端时，自动正常退出并结束残留 Windows Codex 进程；适合不会同时使用两端的用户，详见[退出行为及草稿限制](CONFLICTS.md#自动退出-windows-后端) |
+| `auto_exit_windows_for_wsl_updates` | 默认 `false`；普通单端 WSL → Windows 已有聊天更新可自动退出 Windows 后端；不替冲突选择版本，空闲、兼容性、版本及导入备份保护继续生效 |
+| `auto_exit_windows_desktop_host` | 默认 `false`，需单独主动启用；若 ChatGPT 桌面应用是 Codex 后端的父进程，允许同时退出这个桌面应用，避免它立即重启后端。会关闭桌面聊天窗口，草稿须提前保存；只作用于同用户、同会话且父子创建时间核验通过的进程 |
+| `windows_history_view_only` | 默认 `false`；Windows 仅查看 WSL 记录时主动开启。WSL → Windows 完整导入保留同一聊天 ID 和全部消息，使用专用空目录及只读环境；查看版本的正文不能反向覆盖原项目 |
 | `max_transfers_per_run` | 每轮最多尝试多少条聊天，默认 10 |
 | `run_budget_seconds` | 本轮软时间预算，默认 120 秒 |
 | `operation_timeout_seconds` | 单次端点调用超时，默认 120 秒 |
 | `task_time_limit_minutes` | 计划任务硬时间上限，默认 10 分钟 |
 
 时间与数量字段都须为正整数；布尔值、浮点数、字符串数字不能替代配置中的整数。
+
+## Windows 只查看 WSL 历史
+
+设置 `"windows_history_view_only": true` 后，WSL → Windows 的完整导入在 Windows Codex 数据目录下使用 `.history-sync-view/<聊天ID>` 专用空目录，不使用用户主目录或原 Windows 项目目录作为替代。会话运行环境的 cwd 指向此目录，工作区列表清空，沙箱设为 read-only，审批设为 never；已有 Windows 记录的项目绑定移除。目录链接、重定向和非空目录会使操作停止。
+
+此模式不修改消息正文、工具参数和缓存内容，只转换结构化运行环境并校正索引字节偏移。WSL 原记录不变；目标 `.history-sync-backups/<聊天ID>/<备份目录>/source-package` 保存未转换的完整导出。Windows 查看记录继续沿用原聊天 ID，后续 WSL 更新可补齐，不生成新的可见聊天副本。
+
+Windows 查看版的正文不能反向导入原项目，即使自动数量策略偏向它，也不会因此覆盖 WSL；标题等元数据可按原流程同步。模式不会禁用官方客户端发送框，也不保证阻止用户在客户端主动更改权限；继续操作原 WSL 项目应切回 WSL。原有双方空闲、目标后端停止、精确版本及备份保护保持不变。此开关不会批量重写已经同步且没有更新的聊天，不需要重新初始化基线。
 
 稳定版推荐保持 `conflict_resolution=manual`，在插件的 **Resolve Chat Conflicts** 中明确选择 Windows 或 WSL。先完整备份双方，选择绑定两端精确版本，不生成副本；已保存的手动选择优先于自动计数策略。详见[手动处理冲突](CONFLICTS.md)。
 

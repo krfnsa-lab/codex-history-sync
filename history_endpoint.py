@@ -13,6 +13,7 @@ import bisect
 import ctypes
 import codecs
 import contextvars
+from contextlib import contextmanager
 import functools
 import hashlib
 import json
@@ -39,7 +40,7 @@ LOCAL_FIELDS = {
     "daybreak_enabled", "creator_user_id", "creator_account_id",
 }
 METADATA_FIELDS = ("title", "name", "archived", "archived_at")
-INSPECT_FIELDS = ("id", "rollout_path", "source", "title", "name", "archived", "history_mode")
+INSPECT_FIELDS = ("id", "rollout_path", "source", "title", "name", "archived", "history_mode", "cwd")
 CHUNK_SIZE = 512 * 1024
 MAX_ENVIRONMENT_RECORD_BYTES = 8 * 1024 * 1024
 _PROGRESS_CONTEXT = contextvars.ContextVar("endpoint_progress", default=None)
@@ -321,11 +322,63 @@ def safe_rollout(home, row):
     return path
 
 
+def rollout_storage(path):
+    """Prefer native plaintext; accept only its exact, contained .zst sibling."""
+    path = Path(path)
+    if path.is_file():
+        return path, False
+    compressed = path.with_name(path.name + '.zst')
+    if compressed.is_symlink() or (compressed.exists() and compressed.resolve() != compressed):
+        fail('rollout_outside_home', 'Compressed rollout must remain beside its native logical path')
+    return (compressed, True) if compressed.is_file() else (path, False)
+
+
+def rollout_exists(path):
+    return rollout_storage(path)[0].is_file()
+
+
+def zstd_module():
+    try:
+        from compression import zstd
+    except ImportError:
+        try:
+            from backports import zstd
+        except ImportError:
+            fail('compressed_decoder_missing', 'Compressed archives require Python 3.14 or backports.zstd')
+    return zstd
+
+
+@contextmanager
+def read_rollout(path):
+    """Stream logical JSONL bytes; validate physical storage through the read."""
+    physical, compressed = rollout_storage(path)
+    before = physical.stat()
+    stamp = lambda value: (value.st_size, value.st_mtime_ns, value.st_ctime_ns, value.st_ino)
+    if compressed:
+        module = zstd_module()
+        try:
+            # Bound decoder window memory independently of uncompressed size.
+            with module.ZstdFile(physical, 'rb', options={module.DecompressionParameter.window_log_max: 27}) as stream:
+                yield stream, before, True
+        except (EOFError, module.ZstdError):
+            fail('compressed_rollout_invalid', 'Compressed archive is corrupt or incomplete')
+    else:
+        with physical.open('rb') as stream:
+            yield stream, before, False
+    try:
+        current, current_compressed = rollout_storage(path)
+        after = physical.stat()
+    except FileNotFoundError:
+        fail('source_changed', 'Rollout storage disappeared while it was being read')
+    if current != physical or current_compressed != compressed or stamp(before) != stamp(after):
+        fail('source_changed', 'Rollout storage changed while it was being read')
+
+
 def file_signature(path):
-    if not path.is_file():
+    if not rollout_exists(path):
         return {"size": None, "sha256": None, "complete": False, "mtime_ns": None, "message_hint": False}
-    before = path.stat()
     hasher = hashlib.sha256()
+    total = 0
     last = b""
     line_prefix = b""
     message_hint = False
@@ -337,13 +390,14 @@ def file_signature(path):
             re.search(rb'"type"\s*:\s*"event_msg"', prefix)
             and re.search(rb'"type"\s*:\s*"(?:UserMessage|AgentMessage|user_message|agent_message)"', prefix)
         )
-    with path.open("rb") as stream:
+    with read_rollout(path) as (stream, before, compressed):
         while True:
             chunk = stream.read(CHUNK_SIZE)
             progress_heartbeat()
             if not chunk:
                 break
             hasher.update(chunk)
+            total += len(chunk)
             last = chunk[-1:]
             if not message_hint:
                 parts = chunk.split(b"\n")
@@ -354,11 +408,8 @@ def file_signature(path):
                         line_prefix = b""
                         if message_hint:
                             break
-    complete = not before.st_size or last == b"\n"
-    after = path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        fail("source_changed", "Rollout changed while its revision was being read")
-    return {"size": before.st_size, "sha256": hasher.hexdigest(), "complete": complete,
+    complete = not total or last == b"\n"
+    return {"size": total, "sha256": hasher.hexdigest(), "complete": complete,
             "mtime_ns": before.st_mtime_ns, "message_hint": message_hint}
 
 
@@ -490,6 +541,7 @@ def revision_from_connections(home, row, history, quiet_seconds=60, database="ma
         "transcript_message_hint": file["message_hint"], "item_count": item_count, "turn_count": turn_count,
         "in_progress_recent": in_progress_recent, "quiet_seconds": quiet,
         "cache": summary, "history_mode": row.get("history_mode") or "legacy",
+        "history_view_only": str(row.get("cwd", "")).casefold() == str(home / ".history-sync-view" / row["id"]).casefold(),
     }
 
 
@@ -635,6 +687,7 @@ def database_diagnostic(path, tables, quick_check=False):
 
 def diagnostic_record_counts(home, sources, state_info, history_info):
     result = {"thread_count": 0, "history_mode_counts": {}, "rollout_missing": 0,
+              "compressed_rollouts": 0, "compressed_decoder_missing": 0, "compressed_rollout_invalid": 0,
               "rollout_outside_home": 0, "rollout_incomplete": 0, "rollout_unreadable": 0,
               "paginated_threads_without_cached_items": 0,
               "cache_row_counts": history_info.get("row_counts", {})}
@@ -657,15 +710,24 @@ def diagnostic_record_counts(home, sources, state_info, history_info):
             result["history_mode_counts"][history_mode] = result["history_mode_counts"].get(history_mode, 0) + 1
             try:
                 path = safe_rollout(home, dict(row))
-                if not path.is_file():
+                if not rollout_exists(path):
                     result["rollout_missing"] += 1
-                elif path.stat().st_size:
-                    with path.open("rb") as stream:
-                        stream.seek(-1, os.SEEK_END)
-                        if stream.read(1) != b"\n":
-                            result["rollout_incomplete"] += 1
+                else:
+                    last = b''
+                    with read_rollout(path) as (stream, before, compressed):
+                        if compressed:
+                            result['compressed_rollouts'] += 1
+                            while chunk := stream.read(CHUNK_SIZE):
+                                progress_heartbeat()
+                                last = chunk[-1:]
+                        elif before.st_size:
+                            stream.seek(-1, os.SEEK_END)
+                            last = stream.read(1)
+                    if last and last != b'\n':
+                        result['rollout_incomplete'] += 1
             except EndpointError as error:
-                key = "rollout_missing" if error.code == "rollout_missing" else "rollout_outside_home"
+                key = error.code if error.code in ('compressed_decoder_missing', 'compressed_rollout_invalid') else (
+                    "rollout_missing" if error.code == "rollout_missing" else "rollout_outside_home")
                 result[key] += 1
             except OSError:
                 result["rollout_unreadable"] += 1
@@ -732,6 +794,8 @@ def doctor_home(args):
         ("rollout_outside_home", "部分会话记录不在当前数据目录中，将跳过同步。"),
         ("rollout_incomplete", "部分会话记录尚未写完，将等待下次检查。"),
         ("rollout_unreadable", "部分会话记录无法读取，将跳过同步。"),
+        ("compressed_decoder_missing", "缺少压缩归档解码器；请使用 Python 3.14 或安装 backports.zstd。"),
+        ("compressed_rollout_invalid", "部分压缩归档损坏或尚未写完，未修改原记录。"),
         ("paginated_threads_without_cached_items", "部分分页会话没有正文索引；可能为空会话或旧版记录，需要单独检查。"),
     ):
         if counts[code]:
@@ -760,11 +824,10 @@ def write_json(path, value):
 
 
 def copy_file_checked(source, destination):
-    before = source.stat()
     hasher = hashlib.sha256()
     last = b""
     total = 0
-    with source.open("rb") as reader, destination.open("xb") as writer:
+    with read_rollout(source) as (reader, before, compressed), destination.open("xb") as writer:
         while True:
             chunk = reader.read(CHUNK_SIZE)
             progress_heartbeat()
@@ -776,8 +839,7 @@ def copy_file_checked(source, destination):
             last = chunk[-1:]
         writer.flush()
         os.fsync(writer.fileno())
-    after = source.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or total != before.st_size:
+    if not compressed and total != before.st_size:
         fail("source_changed", "Rollout changed during export")
     if total and last != b"\n":
         fail("incomplete_transcript", "Export requires a complete final JSONL line")
@@ -851,7 +913,7 @@ def export_chat(args):
                 "relative_rollout_path": path.relative_to(home).as_posix(),
                 "metadata_only": bool(args.metadata_only)}
         if not args.metadata_only:
-            if not path.is_file():
+            if not rollout_exists(path):
                 fail("rollout_missing", "Source rollout is missing")
             cache = sqlite3.connect(package / "history.sqlite")
             progress_update("exporting")
@@ -969,7 +1031,27 @@ def environment_path_summary():
             "workspace_roots_removed": 0, "cwd_fallbacks": 0}
 
 
-def rewrite_environment_line(line, platform):
+def history_view_workspace(args, home, meta):
+    """Explicit Windows viewing profile, never a replacement project mapping."""
+    if not getattr(args, 'history_view_only', False) or getattr(args, 'metadata_only', False):
+        return None
+    if native_platform() != 'windows' or meta.get('source_platform') != 'linux' or getattr(args, 'environment_only', False):
+        fail('history_view_invalid', 'History viewing is only supported for Linux-to-Windows full imports')
+    path = home / '.history-sync-view' / meta['thread']['id']
+    for part in (path.parent, path):
+        if part.is_symlink() or part.resolve() != part or (part.exists() and not part.is_dir()):
+            fail('history_view_workspace_unsafe', 'History viewing directory must be a native contained directory')
+    if path.exists() and any(path.iterdir()):
+        fail('history_view_workspace_unsafe', 'History viewing directory must remain empty')
+    return path
+
+
+def reject_history_view_writeback(args, meta):
+    if not getattr(args, 'metadata_only', False) and meta.get('source_revision', {}).get('history_view_only') is True:
+        fail('history_view_writeback_forbidden', 'A history viewing replica cannot replace an original project chat')
+
+
+def rewrite_environment_line(line, platform, view_workspace=None):
     """Only historical environment records carry paths we are allowed to edit.
 
     Message text, tool inputs and unknown nested fields are not path metadata.
@@ -985,6 +1067,26 @@ def rewrite_environment_line(line, platform):
     payload = record.get("payload")
     if not isinstance(payload, dict):
         fail("invalid_environment", "Transcript environment payload must be an object")
+    if view_workspace is not None:
+        # Only structured runtime metadata is changed. Messages and tool inputs
+        # keep their exact bytes; the complete original package is backed up.
+        for key in ('runtime_workspace_roots', 'workspace_roots'):
+            if key in payload and payload[key] is not None and not isinstance(payload[key], list):
+                fail('invalid_workspace_roots', 'Transcript workspace roots must be a list')
+            if isinstance(payload.get(key), list):
+                summary['workspace_roots_removed'] += len(payload[key])
+        if 'cwd' in payload and not isinstance(payload['cwd'], str):
+            fail('invalid_cwd', 'Transcript environment cwd must be a string')
+        payload['cwd'] = str(view_workspace)
+        payload['runtime_workspace_roots'] = []
+        payload['workspace_roots'] = []
+        payload['sandbox_policy'] = {'type': 'read-only'}
+        payload['approval_policy'] = 'never'
+        rewritten = canonical(record) + b'\n'
+        if len(rewritten) > MAX_ENVIRONMENT_RECORD_BYTES:
+            fail('environment_record_too_large', 'History viewing environment exceeds the safe decode limit')
+        summary['environment_lines_changed'] = int(rewritten != line)
+        return rewritten, summary
     changed = False
     if "cwd" in payload:
         original = payload["cwd"]
@@ -1071,7 +1173,7 @@ def transcript_header_kind(prefix):
     return None
 
 
-def transcript_environment_chunks(stream, platform):
+def transcript_environment_chunks(stream, platform, view_workspace=None):
     """Bound buffers for large message/image records, retaining their bytes.
 
     Native Codex writes a top-level type before the payload, with optional
@@ -1085,7 +1187,7 @@ def transcript_environment_chunks(stream, platform):
         if not initial:
             return
         if initial.endswith(b"\n"):
-            rewritten, counts = rewrite_environment_line(initial, platform)
+            rewritten, counts = rewrite_environment_line(initial, platform, view_workspace)
             yield initial, rewritten, counts
             continue
         kind = transcript_header_kind(initial)
@@ -1113,23 +1215,19 @@ def transcript_environment_chunks(stream, platform):
                 fail("incomplete_transcript", "Environment repair requires complete JSONL records")
             record.extend(chunk)
         original = bytes(record)
-        rewritten, counts = rewrite_environment_line(original, platform)
+        rewritten, counts = rewrite_environment_line(original, platform, view_workspace)
         yield original, rewritten, counts
 
 
-def inspect_workspace_environment(path, platform=None):
+def inspect_workspace_environment(path, platform=None, view_workspace=None):
     """Read-only repair preview, exposing counts rather than private paths."""
     path = Path(path)
     platform = platform or native_platform()
     summary = environment_path_summary()
-    before = path.stat()
-    with path.open("rb") as stream:
-        for _, _, counts in transcript_environment_chunks(stream, platform):
+    with read_rollout(path) as (stream, before, compressed):
+        for _, _, counts in transcript_environment_chunks(stream, platform, view_workspace):
             for key in summary:
                 summary[key] += counts[key]
-    after = path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        fail("source_changed", "Transcript changed during the environment preview")
     return summary
 
 
@@ -1146,7 +1244,7 @@ def path_preview(args):
         if row.get("source") not in sources:
             fail("out_of_scope", "Requested chat is outside the configured scope")
         path = safe_rollout(home, row)
-        if not path.is_file():
+        if not rollout_exists(path):
             fail("rollout_missing", "Chat rollout is missing")
         summary = inspect_workspace_environment(path)
         cwd_changed = local_environment_cwd(row.get("cwd", "")) != row.get("cwd", "")
@@ -1157,7 +1255,7 @@ def path_preview(args):
         state.close()
 
 
-def rewrite_transcript_environment(source, destination, platform=None):
+def rewrite_transcript_environment(source, destination, platform=None, view_workspace=None):
     """Stage mapped environment records and the exact old/new byte boundaries.
 
     The transport package remains untouched and retains its original checksum.
@@ -1172,7 +1270,7 @@ def rewrite_transcript_environment(source, destination, platform=None):
     old_offset = new_offset = 0
     changes = []
     with source.open("rb") as reader, destination.open("xb") as writer:
-        for line, rewritten, counts in transcript_environment_chunks(reader, platform):
+        for line, rewritten, counts in transcript_environment_chunks(reader, platform, view_workspace):
             for key in summary:
                 summary[key] += counts[key]
             if rewritten != line:
@@ -1344,11 +1442,13 @@ def import_preview(args):
     Package corruption is still an error. Unsupported native environment paths
     are a normal deferral so a controller can continue with other quiet chats.
     """
-    native_home(args.home)
+    home = native_home(args.home)
     sources = scoped_sources(args.scope)
     package = Path(args.package).expanduser().resolve()
     meta = json.loads((package / "meta.json").read_text(encoding="utf-8"))
     check_package(meta, package, False)
+    reject_history_view_writeback(args, meta)
+    view_workspace = history_view_workspace(args, home, meta)
     imported = meta["thread"]
     if imported.get("source") not in sources:
         fail("out_of_scope", "Package chat is outside the configured scope")
@@ -1356,13 +1456,14 @@ def import_preview(args):
                          "invalid_environment", "invalid_workspace_roots", "environment_record_too_large",
                          "transcript_record_too_large", "transcript_header_unsupported", "incomplete_transcript"}
     try:
-        mapped_cwd = local_environment_cwd(imported.get("cwd", ""))
-        summary = inspect_workspace_environment(package / "transcript.jsonl")
+        mapped_cwd = str(view_workspace) if view_workspace is not None else local_environment_cwd(imported.get("cwd", ""))
+        summary = inspect_workspace_environment(package / "transcript.jsonl", view_workspace=view_workspace)
     except EndpointError as error:
         if error.code not in compatible_errors:
             raise
         return {"ok": True, "id": imported["id"], "compatible": False, "reason": error.code}
     return {"ok": True, "id": imported["id"], "compatible": True,
+            "history_view_only": view_workspace is not None,
             "environment_paths": summary, "database_cwd_changed": mapped_cwd != imported.get("cwd", "")}
 
 
@@ -1377,7 +1478,7 @@ def backup_chat(home, target, row, thread_id):
     saved = {"thread": row, "format_version": FORMAT_VERSION}
     if row is not None:
         path = safe_rollout(home, row)
-        if path.is_file():
+        if rollout_exists(path):
             saved["transcript"] = copy_file_checked(path, folder / "transcript.jsonl")
             saved["rollout_path"] = str(path)
     write_json(folder / "backup.json", saved)
@@ -1391,6 +1492,8 @@ def import_chat(args):
     package = Path(args.package).expanduser().resolve()
     meta = json.loads((package / "meta.json").read_text(encoding="utf-8"))
     check_package(meta, package, args.metadata_only)
+    reject_history_view_writeback(args, meta)
+    view_workspace = history_view_workspace(args, home, meta)
     imported = meta["thread"]
     thread_id = imported["id"]
     environment_only = bool(getattr(args, "environment_only", False))
@@ -1452,28 +1555,44 @@ def import_chat(args):
                     fail("environment_source_mismatch", "Environment repair package must match this exact native chat revision and transcript")
         destination = safe_rollout(home, existing) if environment_only else target_rollout(home, meta, existing)
         old_path = safe_rollout(home, existing) if existing is not None else None
-        if destination.exists() and (old_path is None or destination != old_path):
+        if rollout_exists(destination) and (old_path is None or destination != old_path):
             fail("rollout_collision", "Destination rollout already exists without the expected target record")
         if not args.metadata_only:
             cache = readonly(package / "history.sqlite")
             validate_cache_schema(target, cache)
         progress_update("backing_up")
         backup = backup_chat(home, target, existing, thread_id)
+        if view_workspace is not None:
+            preserved = backup / 'source-package'
+            preserved.mkdir()
+            for name in ('meta.json', 'history.sqlite', 'transcript.jsonl'):
+                shutil.copy2(package / name, preserved / name)
         write_json(backup / "journal.json", {"status": "pending", "id": thread_id, "expected": args.expected,
                    "destination": str(destination), "metadata_only": bool(args.metadata_only),
                    "environment_only": environment_only})
         destination.parent.mkdir(parents=True, exist_ok=True)
         progress_update("writing")
+        if view_workspace is not None:
+            history_view_workspace(args, home, meta)  # Recheck containment before creating the empty directory.
+            view_workspace.mkdir(parents=True, exist_ok=True)
         if args.metadata_only:
             if old_path is not None and old_path != destination:
-                if not old_path.is_file():
+                if not rollout_exists(old_path):
                     fail("rollout_missing", "Cannot move a missing target rollout for archive metadata")
-                os.replace(old_path, destination)
+                if old_path.is_file():
+                    os.replace(old_path, destination)
+                else:
+                    # Preserve the original compressed archive. Install a
+                    # complete plaintext version at the newly indexed path.
+                    staged = destination.with_name(destination.name + '.sync-' + uuid.uuid4().hex + '.tmp')
+                    copy_file_checked(old_path, staged)
+                    os.replace(staged, destination)
+                    staged = None
                 moved_from = old_path
                 installed = True
         else:
             staged = destination.with_name(destination.name + ".sync-" + uuid.uuid4().hex + ".tmp")
-            rewrite = rewrite_transcript_environment(package / "transcript.jsonl", staged)
+            rewrite = rewrite_transcript_environment(package / "transcript.jsonl", staged, view_workspace=view_workspace)
             environment_paths = {key: rewrite[key] for key in environment_paths}
             if existing is not None:
                 # Recheck full bytes under the SQLite write lock before
@@ -1485,7 +1604,7 @@ def import_chat(args):
             staged = None
             installed = True
             if old_path is not None and old_path != destination:
-                old_path.unlink()
+                old_path.unlink(missing_ok=True)
                 moved_from = old_path
             with (package / "transcript.jsonl").open("rb") as offset_source:
                 if environment_only:
@@ -1519,7 +1638,12 @@ def import_chat(args):
             database_cwd_changed = updates["cwd"] != existing.get("cwd", "")
         else:
             updates = {key: value for key, value in imported.items() if key in PORTABLE_FIELDS and key in target_columns and key not in LOCAL_FIELDS}
-            updates["cwd"] = local_environment_cwd(imported.get("cwd", ""))
+            updates["cwd"] = str(view_workspace) if view_workspace is not None else local_environment_cwd(imported.get("cwd", ""))
+            if view_workspace is not None:
+                updates['sandbox_policy'] = '{"type":"read-only"}'
+                updates['approval_mode'] = 'never'
+                if 'project_id' in target_columns:
+                    updates['project_id'] = None
             database_cwd_changed = updates["cwd"] != imported.get("cwd", "")
         if not environment_only:
             updates["rollout_path"] = str(destination)
@@ -1606,6 +1730,8 @@ def build_parser():
             command.add_argument("--metadata-only", action="store_true")
         if name == "import-preview":
             command.add_argument("--package", required=True)
+        if name in ('import', 'import-preview'):
+            command.add_argument('--history-view-only', action='store_true')
         if name in ("export", "path-preview"):
             command.add_argument("--id", required=True)
         if name == "import":

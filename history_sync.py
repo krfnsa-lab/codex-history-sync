@@ -24,7 +24,7 @@ import uuid
 from history_progress import ProgressWriter
 
 VERSION = 1
-SOFTWARE_VERSION = '2.2.2'
+SOFTWARE_VERSION = '2.3.1'
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MAX_TRANSFERS = 10
 DEFAULT_RUN_BUDGET = 120
@@ -169,6 +169,10 @@ def build_plan(windows, wsl, ledger, quiet_seconds=60, conflict_resolution='manu
                     decision['waiting_reason'] = 'target_busy'
                 blocked.append({'id': tid, 'reason': 'target_busy', **resolution_info})
                 continue
+        if source == 'windows' and mode == 'full' and (row.get('history_view_only') is True or
+                ((old or {}).get('windows') or {}).get('history_view_only') is True):
+            blocked.append({'id': tid, 'reason': 'history_view_writeback_forbidden'})
+            continue
         if is_busy(row, quiet_seconds):
             if decision is not None:
                 decision['waiting_reason'] = 'source_busy'
@@ -256,6 +260,8 @@ class Endpoints:
                 raise RuntimeError('WSL stopped during this run; deferred until the next run')
             cmd = ['wsl.exe', '--distribution', self.config['wsl_distro'], '--user', self.config['wsl_user'], '--exec', self.config.get('python_wsl', '/usr/bin/python3'), linux_mount_path(self.script), operation, '--home', self.config['wsl_home']]
         cmd += ['--quiet-seconds', str(self.config.get('quiet_seconds', 60)), *map(str, args), *progress_args]
+        if side == 'windows' and operation in ('import', 'import-preview') and self.config.get('windows_history_view_only', False) and '--metadata-only' not in args and '--environment-only' not in args:
+            cmd.append('--history-view-only')
         result = subprocess.run(cmd, capture_output=True, timeout=self.config.get('operation_timeout_seconds', 120),
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         try:
@@ -363,6 +369,8 @@ def add_manual_choices(plan, views, runtime, quiet_seconds):
             reason = 'source_busy'
         elif any(row.get('transcript_complete') is not True or row.get('item_count', 0) <= 0 for row in rows.values()):
             reason = 'unreadable_transcript'
+        elif choice['keep_side'] == 'windows' and rows['windows'].get('history_view_only') is True:
+            reason = 'history_view_writeback_forbidden'
         target = 'wsl' if choice['keep_side'] == 'windows' else 'windows'
         if reason is None and views[target].get('backend_running', True):
             reason = 'target_backend_running'
@@ -382,6 +390,136 @@ def add_manual_choices(plan, views, runtime, quiet_seconds):
     if decisions:
         plan['manual_choices'] = decisions
     return store, updates
+
+
+def close_windows_for_choices(config, endpoint, plan, views, runtime, reporter=None):
+    """Only explicit, quiet, exact-version WSL choices authorize automatic exit."""
+    if not config.get('auto_exit_windows_for_wsl_choices', False):
+        return None
+    candidates = [item for item in plan.get('manual_choices', [])
+                  if item.get('keep_side') == 'wsl' and item.get('reason') == 'target_backend_running']
+    if not candidates:
+        return None
+    if (runtime / 'pending.json').exists():
+        raise RuntimeError('An unfinished prior import exists; review runtime/pending.json before continuing')
+    if views['windows'].get('backend_detection_ok') is not True:
+        return {'status': 'waiting', 'reason': 'windows_exit_unavailable'}
+    # Preserve other known Windows requests, not just the selected chat.
+    if any(row.get('active') for row in views['windows'].get('threads', [])):
+        return {'status': 'waiting', 'reason': 'windows_exit_busy'}
+    store = read_conflict_choices(runtime)
+    compatible = set()
+    for item in candidates:
+        choice = store['choices'][item['id']]
+        # A queued decision is not permission to discard either private backup.
+        for side in ('windows', 'wsl'):
+            conflict_choice_package(runtime, choice, side)
+        package = conflict_choice_package(runtime, choice, 'wsl')
+        preview = endpoint.call('windows', 'import-preview', '--package', package)
+        if preview.get('compatible') is True:
+            compatible.add(item['id'])
+    if not compatible:
+        return {'status': 'waiting', 'reason': 'windows_exit_incompatible'}
+    # Preflight may be slow. Revalidate both choices and all known Windows
+    # activity immediately before issuing any process operation.
+    fresh = {side: endpoint.inspect(side) for side in ('windows', 'wsl')}
+    check = {'actions': [], 'blocked': [], 'baseline_pairs': []}
+    add_manual_choices(check, fresh, runtime, config.get('quiet_seconds', 60))
+    current = {item['id'] for item in check.get('manual_choices', [])
+               if item.get('keep_side') == 'wsl' and item.get('reason') == 'target_backend_running'}
+    if not compatible.intersection(current):
+        return {'status': 'waiting', 'reason': 'windows_exit_choice_changed'}
+    if fresh['windows'].get('backend_detection_ok') is not True:
+        return {'status': 'waiting', 'reason': 'windows_exit_unavailable'}
+    if any(row.get('active') for row in fresh['windows'].get('threads', [])):
+        return {'status': 'waiting', 'reason': 'windows_exit_busy'}
+    from history_windows import stop_windows_codex
+    def heartbeat():
+        if reporter is not None:
+            reporter.update('checking_backend', side='windows')
+    heartbeat()
+    return stop_windows_codex(heartbeat=heartbeat, allow_desktop_exit=config.get('auto_exit_windows_desktop_host', False))
+
+
+def ordinary_wsl_updates(config, views, ledger, runtime):
+    """Lift only Windows's process flag; keep all production planner guards."""
+    relaxed = {**views, 'windows': {**views['windows'], 'backend_running': False}}
+    plan = build_plan(relaxed['windows'], relaxed['wsl'], ledger, config.get('quiet_seconds', 60),
+                      config.get('conflict_resolution', 'manual'))
+    add_manual_choices(plan, relaxed, runtime, config.get('quiet_seconds', 60))
+    return [item for item in plan['actions'] if item['source'] == 'wsl' and item['target'] == 'windows'
+            and item['target_revision'] != 'absent' and not item.get('conflict_resolution')]
+
+
+def restrict_outgoing_plan(plan, choice_store, choice_updates):
+    """Scope a WSL companion request to Windows writes, including after exit.
+
+    This mode must not acknowledge new baseline pairs or persist unrelated
+    Windows-winner decisions while its WSL backend remains open.
+    """
+    plan['actions'] = [a for a in plan['actions'] if a['source'] == 'wsl' and a['target'] == 'windows']
+    plan['baseline_pairs'] = []
+    for key, side_key in (('manual_choices', 'keep_side'), ('conflict_decisions', 'source')):
+        if key in plan:
+            plan[key] = [a for a in plan[key] if a.get(side_key) == 'wsl']
+    return {tid: value for tid, value in choice_updates.items()
+            if choice_store['choices'].get(tid, {}).get('keep_side') == 'wsl'}
+
+
+def close_windows_for_updates(config, endpoint, views, ledger, runtime, reporter=None, deadline=None):
+    """Opt-in automatic exit for ordinary, one-sided WSL -> Windows updates."""
+    if not config.get('auto_exit_windows_for_wsl_updates', False) or not views['windows'].get('backend_running', True):
+        return None
+    candidates = ordinary_wsl_updates(config, views, ledger, runtime)
+    if not candidates:
+        return None
+    if (runtime / 'pending.json').exists():
+        raise RuntimeError('An unfinished prior import exists; review runtime/pending.json before continuing')
+    if views['windows'].get('backend_detection_ok') is not True:
+        return {'status': 'waiting', 'reason': 'windows_exit_unavailable'}
+    if any(row.get('active') for row in views['windows'].get('threads', [])):
+        return {'status': 'waiting', 'reason': 'windows_exit_busy'}
+    compatible = {}
+    for action in candidates[:config.get('max_transfers_per_run', DEFAULT_MAX_TRANSFERS)]:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        if action['mode'] == 'metadata':
+            compatible[action['id']] = action
+            continue
+        # Check environment compatibility before closing an application. The
+        # package is temporary; actual transfer still exports a fresh exact
+        # source version and backs up the stopped target before replacement.
+        with tempfile.TemporaryDirectory(prefix='exit-preflight-', dir=runtime) as folder:
+            try:
+                endpoint.call('wsl', 'export', '--id', action['id'], '--package', linux_mount_path(folder),
+                              '--expected', action['source_revision'])
+            except EndpointCallError as error:
+                if error.side == 'wsl' and error.operation == 'export' and error.code in ('source_active', 'source_changed', 'thread_missing'):
+                    continue
+                raise
+            preview = endpoint.call('windows', 'import-preview', '--package', folder)
+            if preview.get('compatible') is True:
+                compatible[action['id']] = action
+    if not compatible:
+        return {'status': 'waiting', 'reason': 'windows_exit_time_budget' if deadline is not None and time.monotonic() >= deadline else 'windows_exit_incompatible'}
+    fresh = {side: endpoint.inspect(side) for side in ('windows', 'wsl')}
+    current = ordinary_wsl_updates(config, fresh, ledger, runtime)
+    if not any(action == compatible.get(action['id']) for action in current):
+        return {'status': 'waiting', 'reason': 'windows_exit_choice_changed'}
+    if fresh['windows'].get('backend_detection_ok') is not True:
+        return {'status': 'waiting', 'reason': 'windows_exit_unavailable'}
+    if any(row.get('active') for row in fresh['windows'].get('threads', [])):
+        return {'status': 'waiting', 'reason': 'windows_exit_busy'}
+    if deadline is not None and time.monotonic() >= deadline:
+        return {'status': 'waiting', 'reason': 'windows_exit_time_budget'}
+    if not fresh['windows'].get('backend_running', True):
+        return {'status': 'stopped', 'reason': 'windows_exit_completed', 'process_count': 0, 'forced_count': 0}
+    from history_windows import stop_windows_codex
+    def heartbeat():
+        if reporter is not None:
+            reporter.update('checking_backend', side='windows')
+    heartbeat()
+    return stop_windows_codex(heartbeat=heartbeat, allow_desktop_exit=config.get('auto_exit_windows_desktop_host', False))
 
 
 @contextmanager
@@ -491,6 +629,29 @@ def _execute(config, args, runtime, log, progress=None, reporter=None):
                       config.get('conflict_resolution', 'manual'))
     choice_store, choice_updates = add_manual_choices(plan, {'windows': windows, 'wsl': wsl}, runtime,
                                                      config.get('quiet_seconds', 60))
+    outgoing_only = getattr(args, 'outgoing_only', False) is True
+    if outgoing_only:
+        choice_updates = restrict_outgoing_plan(plan, choice_store, choice_updates)
+    windows_exit = None
+    if not args.dry_run:
+        windows_exit = close_windows_for_choices(config, endpoint, plan,
+                        {'windows': windows, 'wsl': wsl}, runtime, reporter)
+        if windows_exit is None:
+            windows_exit = close_windows_for_updates(config, endpoint,
+                            {'windows': windows, 'wsl': wsl}, ledger, runtime, reporter, started + budget)
+        if windows_exit is not None:
+            # Exit can flush messages or a launcher can start another backend.
+            # Rebuild from native snapshots; never relax a backend/version guard.
+            windows, wsl = endpoint.inspect('windows'), endpoint.inspect('wsl')
+            states = {'windows': records(windows), 'wsl': records(wsl)}
+            plan = build_plan(windows, wsl, ledger, config.get('quiet_seconds', 60),
+                              config.get('conflict_resolution', 'manual'))
+            choice_store, choice_updates = add_manual_choices(plan, {'windows': windows, 'wsl': wsl}, runtime,
+                                                             config.get('quiet_seconds', 60))
+            if outgoing_only:
+                choice_updates = restrict_outgoing_plan(plan, choice_store, choice_updates)
+            if windows.get('backend_running', True) and windows_exit.get('status') == 'stopped':
+                windows_exit.update(status='waiting', reason='windows_exit_incomplete')
     if reporter is not None:
         reporter.update('planning', total_chats=len(plan['actions']),
                         deferred_chats=len(plan['blocked']))
@@ -502,6 +663,10 @@ def _execute(config, args, runtime, log, progress=None, reporter=None):
                'run_limits': limits,
                'inspected_chats': {side: len(rows) for side, rows in states.items()},
                'endpoint_skipped': {'windows': windows.get('skipped', []), 'wsl': wsl.get('skipped', [])}})
+    if windows_exit is not None:
+        summary['windows_exit'] = windows_exit
+    if outgoing_only:
+        summary['outgoing_only'] = True
     if 'conflict_decisions' in plan:
         summary['conflict_decisions'] = plan['conflict_decisions']
         summary['resolved_conflicts'] = 0
@@ -639,6 +804,8 @@ def _execute(config, args, runtime, log, progress=None, reporter=None):
                                                     'backup': imported.get('backup')})
                 next(value for value in summary['manual_choices'] if value['choice_id'] == action['choice_id'])['status'] = 'resolved'
             summary['transferred'] += 1
+            if action['mode'] == 'full' and target_record.get('history_view_only') is True:
+                summary['history_view_imports'] = summary.get('history_view_imports', 0) + 1
             if action.get('conflict_resolution') == 'prefer_longer':
                 summary['resolved_conflicts'] += 1
                 decision = next(value for value in plan['conflict_decisions'] if value['id'] == action['id'])
@@ -786,6 +953,9 @@ def validate_config(config):
         raise ValueError('配置项 python_wsl 不是有效字符串')
     if config.get('conflict_resolution', 'manual') not in ('manual', 'prefer_longer'):
         raise ValueError('配置项 conflict_resolution 须为 manual 或 prefer_longer')
+    for key in ('auto_exit_windows_for_wsl_choices', 'auto_exit_windows_for_wsl_updates', 'auto_exit_windows_desktop_host', 'windows_history_view_only'):
+        if type(config.get(key, False)) is not bool:
+            raise ValueError(f'配置项 {key} 须为 true 或 false')
     for key, default in (('max_transfers_per_run', DEFAULT_MAX_TRANSFERS),
                          ('run_budget_seconds', DEFAULT_RUN_BUDGET),
                          ('operation_timeout_seconds', 120), ('quiet_seconds', 60),
@@ -946,6 +1116,9 @@ STATUS_LABELS = {
     'skipped_already_running': '已有同步正在运行，本轮已跳过', 'error': '运行失败',
 }
 REASON_LABELS = {
+    'history_view_writeback_forbidden': 'Windows 历史查看记录不能反向覆盖原项目聊天',
+    'compressed_decoder_missing': '缺少压缩归档解码器（Python 3.14 或 backports.zstd）',
+    'compressed_rollout_invalid': '压缩归档损坏或尚未写完',
     'batch_limit': '达到每轮数量上限', 'time_budget': '达到每轮时间预算',
     'target_backend_running': '目标侧 Codex 正在运行', 'target_backend_started': '目标侧 Codex 在传输前启动',
     'source_busy': '源聊天仍活跃或未静默', 'target_busy': '目标聊天仍活跃或未静默',
@@ -968,6 +1141,8 @@ REASON_LABELS = {
     'transcript_header_unsupported': '大记录的头部格式尚不支持，需检查格式兼容性',
 }
 COUNT_LABELS = {'thread_count': '聊天', 'rollout_missing': '正文缺失',
+    'compressed_rollouts': '压缩归档', 'compressed_decoder_missing': '缺少压缩解码器',
+    'compressed_rollout_invalid': '压缩归档不完整或损坏',
     'rollout_outside_home': '正文路径越界', 'rollout_incomplete': '正文未写完',
     'rollout_unreadable': '正文不可读', 'paginated_threads_without_cached_items': '分页正文索引为空'}
 
@@ -1050,6 +1225,20 @@ def human_summary(value, include_issues=True):
         lines.append(f"待同步：{value['planned_transfers']} 条；已同步：{value['transferred']} 条；留待下轮：{value['remaining_transfers']} 条")
         if include_issues:
             lines.extend(issue_lines(value))
+    if value.get('windows_exit'):
+        reason = value['windows_exit'].get('reason')
+        labels = {
+            'windows_exit_completed': 'Windows Codex 后端已自动退出，随后重新检查版本和同步条件',
+            'windows_exit_incomplete': 'Windows Codex 后端仍在运行或已重新启动，尚未覆盖记录',
+            'windows_exit_busy': 'Windows 仍有聊天正在处理或未静默，暂未自动退出',
+            'windows_exit_unavailable': '无法核验 Windows 后端，暂未自动退出',
+            'windows_exit_failed': 'Windows 后端自动退出未完成，请检查进程权限；未绕过同步保护',
+            'windows_exit_incompatible': '选中聊天的工作区或正文尚不兼容，暂未关闭 Windows Codex',
+            'windows_exit_choice_changed': '聊天版本或活动状态已变化，暂未关闭 Windows Codex',
+            'windows_exit_time_budget': '本轮预检查已达到时间预算，未关闭 Windows Codex；下轮继续检查',
+            'windows_exit_desktop_required': 'Windows ChatGPT 桌面应用会重启后端，需要单独允许退出桌面应用；未反复结束子进程',
+        }
+        lines.append(labels.get(reason, '已检查 Windows 后端自动退出状态'))
     if value.get('initialization_required'):
         lines.append('首次启用前请先运行 .\\sync-now.ps1 -Initialize')
     if value.get('batch_stop_reason'):

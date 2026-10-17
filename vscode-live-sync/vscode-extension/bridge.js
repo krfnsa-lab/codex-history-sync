@@ -125,6 +125,8 @@ async function runWindows(config, mode, requestId) {
     ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--recovery-state']
     : mode === true
     ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json']
+    : mode === 'outgoing'
+    ? [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--sync-outgoing-once']
     : [config.previewHelper, '--controller', config.windowsController, '--config', config.windowsConfig, '--json', '--sync-once'];
   if (requestId !== undefined) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) throw new Error('Invalid progress request.');
@@ -184,6 +186,7 @@ const deferredReasons = {
   workspace_cwd_unmappable: '工作目录无法映射到目标系统', environment_paths_unavailable: '目标工作目录不可用',
   source_busy: '来源聊天正在使用', source_changed: '来源版本在检查后发生变化',
   source_disappeared: '来源记录已不存在', target_backend_started: '目标后端在同步前重新启动',
+  history_view_writeback_forbidden: 'Windows 历史查看记录不能反向覆盖 WSL 原项目聊天',
   manual_choice_stale: '已选版本发生变化，需要重新确认', other: '其他条件未通过，请查看同步详情'
 };
 function safeDeferredCounts(value) {
@@ -228,16 +231,31 @@ function describeResult(result) {
     native_sync_can_run: '当前未连接 Codex 后端，请等待定时同步或运行基础同步脚本。',
     new_chats_pending: '有新聊天待导入；当前窗口自动补齐只处理已有聊天，请通过基础同步导入。',
     opposite_direction_pending: '有 WSL → Windows 更新待同步；请等待 Windows Codex 空闲并停止后端后使用基础同步。',
+    windows_exit_busy: 'Windows 仍有活跃聊天任务，本次未退出或覆盖。任务结束并静默后，可再次点击手动同步。',
+    windows_exit_desktop_required: 'Windows 桌面应用会重新启动后端，需先开启退出整个桌面应用的设置；此次未同步。',
+    windows_exit_incomplete: 'Windows 后端退出后仍检测到运行实例，此次未覆盖记录。',
+    windows_exit_incompatible: '待更新记录未通过 Windows 导入兼容检查，此次未同步。',
+    windows_exit_failed: 'Windows 后端未能退出，此次未覆盖记录。请查看同步详情。',
+    windows_exit_unavailable: '无法确认 Windows 后端状态，此次未退出或覆盖记录。',
+    windows_exit_choice_changed: '退出前发现聊天版本或选择已经变化，此次未按旧版本覆盖。',
+    windows_exit_time_budget: 'Windows 退出预检查达到本轮时间预算，此次未覆盖记录。',
     longer_wsl_pending: '已选择 WSL 中聊天更多的一端。等待桌面端 Codex 后端停止后，定时任务会先备份旧版本，再同步到 Windows。',
     wsl_stopped: 'WSL 未运行，此次未同步。',
     baseline_missing: '缺少同步基线，此次未同步。请先初始化基础同步器。',
     pending_import: '存在未完成的导入，此次未同步。请先检查恢复记录。',
     backend_detection_failed: '无法确认 Codex 后端状态，为保护聊天记录，此次未同步。',
     incoming_update_blocked: '检测到待更新聊天，但正文读取或索引检查未通过。未修改记录，请检查基础同步器的问题报告。',
+    outgoing_update_blocked: '有 WSL → Windows 更新未通过导入兼容性检查。此次未同步，继续等待或退出 Windows 后端不能解决该问题，请查看具体原因。',
     gateway_unavailable: '当前没有可用的同步桥，此次未同步。请确认已完成设置并重载窗口。',
     no_pending_updates: '未发现可补齐到 WSL 的新更新。检查完成不代表执行了同步。'
   };
   if (result.kind === 'synced' && Number.isInteger(result.result?.transferred) && result.result.transferred > 0) {
+    if (result.result.outgoing_only === true) {
+      const busy = Array.isArray(result.result.blocked) ? result.result.blocked.filter(item => ['source_busy', 'target_busy'].includes(item.reason)).length : 0;
+      return { text: `$(check) Codex：已同步 ${result.result.transferred} 条到 Windows`,
+        detail: `本轮实际同步 ${result.result.transferred} 条聊天到 Windows。WSL 窗口未暂停或重载。` +
+          (busy ? `另有 ${busy} 条聊天仍活跃或未静默，未同步。` : ''), warning: false };
+    }
     const conflicts = Number.isInteger(result.preview?.conflict_count) && result.preview.conflict_count > 0 ? result.preview.conflict_count : 0;
     const resolved = Number.isInteger(result.result.resolved_conflicts) && result.result.resolved_conflicts > 0 ? result.result.resolved_conflicts : 0;
     const manualResolved = Array.isArray(result.result.conflict_results) ? result.result.conflict_results.filter(choice => choice.reason === 'manual_keep').length : 0;
@@ -280,12 +298,18 @@ function describeResult(result) {
   const deferredDetail = Object.entries(failedCounts).map(([key, count]) => `${deferredReasons[key]}：${count} 条`).join('；');
   const retryDetail = result.reason === 'retry_backoff' && Number.isSafeInteger(result.retry_after_seconds) && result.retry_after_seconds > 0
     ? `自动重试还需约 ${result.retry_after_seconds} 秒。` : '';
+  const automaticOutgoing = result.reason === 'opposite_direction_pending' && result.preview?.windows_auto_exit_enabled === true;
   const explanation = stale ? reasons.manual_choice_stale
-    : incompatible ? '聊天工作目录无法映射到目标系统中存在的目录。未替换聊天，请检查工作目录兼容性。'
+    : incompatible ? (result.reason === 'outgoing_update_blocked'
+      ? '聊天的 WSL 工作目录无法映射到 Windows 中存在的目录。此次未同步；继续等待或退出后端不能解决，需要先解决两端项目目录兼容性。原记录已保留。'
+      : '聊天工作目录无法映射到目标系统中存在的目录。未替换聊天，请检查工作目录兼容性。')
+    : automaticOutgoing ? (result.preview?.outgoing_sync_supported === true
+      ? '有 WSL → Windows 更新待同步。手动检查可立即执行；自动任务仍按配置间隔运行。同步会按需退出 Windows 后端，WSL 窗口保持打开；实际结果以传输回执为准。'
+      : '有 WSL → Windows 更新待同步；当前插件检查仅作预览，未执行传输。请更新同步插件后使用手动立即同步，或等待定时任务。')
     : result.reason === 'chat_conflict' && result.preview?.conflict_resolution === 'prefer_longer'
     ? '两端聊天数量相同、无法可靠比较，或尚未建立可用基线。已保留两端，未自动选择版本。'
     : codexWait || reasons[result.reason] || '无法确认同步结果，此次未报告同步成功。';
-  return { text: selectedText, detail: explanation + retryDetail + (deferredDetail ? `\n上次未同步原因：${deferredDetail}。` : '') + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
+  return { text: automaticOutgoing ? '$(history) Codex：等待自动同步到 Windows' : selectedText, detail: explanation + retryDetail + (deferredDetail ? `\n上次未同步原因：${deferredDetail}。` : '') + selectionDetail + manualDetail + (diagnostics ? `\n检查原因：${diagnostics}` : ''),
     warning: ['conflict', 'blocked'].includes(result.kind) };
 }
 
@@ -376,6 +400,26 @@ class Coordinator {
       }
       const preview = await this.callWindows(true);
       if (!this.shouldContinue()) return { kind: 'waiting', reason: 'sync_disabled', preview };
+      if (options.manual === true && preview.outgoing_sync_supported === true &&
+          preview.eligible !== true && Number.isSafeInteger(preview.opposite_direction_count) && preview.opposite_direction_count > 0 &&
+          ['opposite_direction_pending', 'chat_busy', 'longer_wsl_pending'].includes(preview.reason)) {
+        // Export WSL reads and write only Windows. No WSL pause lease, draft
+        // confirmation, local-setting acknowledgement or editor reload belongs
+        // to this operation; the native controller owns all target guards.
+        if (Number.isFinite(preview.controller_timeout_seconds)) this.config.controllerTimeoutSeconds = Math.max(this.config.controllerTimeoutSeconds || 600, preview.controller_timeout_seconds);
+        const result = await this.callWindows('outgoing');
+        if (result.status === 'skipped_already_running') return { kind: 'waiting', reason: 'controller_running', result, preview };
+        if (result.status !== 'completed' || result.outgoing_only !== true || !Number.isSafeInteger(result.transferred) || result.transferred < 0) {
+          throw new Error('Windows 同步未返回可验证的传输结果。');
+        }
+        if (result.transferred > 0) {
+          try { await this.onDeferred(0, {}); } catch { /* Committed transfer remains valid. */ }
+          return { kind: 'synced', result, preview };
+        }
+        const reason = result.windows_exit?.reason ||
+          (result.blocked?.some(item => ['source_busy', 'target_busy'].includes(item.reason)) ? 'chat_busy' : 'zero_transfers');
+        return { kind: 'waiting', reason, deferred_reason_counts: deferredCounts(result), result, preview };
+      }
       if (preview.eligible !== true || !Array.isArray(preview.candidate_ids) || preview.candidate_ids.length === 0) return previewResult(preview);
       if (Number.isFinite(preview.controller_timeout_seconds)) this.config.controllerTimeoutSeconds = Math.max(this.config.controllerTimeoutSeconds || 600, preview.controller_timeout_seconds);
       this.progress('gateway');

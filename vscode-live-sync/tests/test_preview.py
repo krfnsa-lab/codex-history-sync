@@ -9,7 +9,7 @@ import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 def module(name, path):
@@ -111,6 +111,80 @@ class PreviewTests(unittest.TestCase):
         a,b,ledger=self.inputs(); a['threads'][0]=ledger['threads']['synthetic-thread']['windows'].copy()
         result=preview.classify_plan(sync,a,b,ledger,60)
         self.assertEqual(result['reason'],'no_pending_updates')
+
+    def test_busy_outgoing_chat_does_not_instruct_windows_backend_shutdown(self):
+        a,b,ledger=self.inputs()
+        a['threads'][0]=ledger['threads']['synthetic-thread']['windows'].copy()
+        b['threads'][0].update(revision='new-wsl',content_revision='new-wsl-body',active=True,quiet_seconds=1)
+        a['backend_running']=True
+        result=preview.classify_plan(sync,a,b,ledger,60)
+        self.assertEqual(result['reason'],'chat_busy')
+        self.assertEqual(result['opposite_direction_count'],1)
+
+    def outgoing_inputs(self):
+        a,b,ledger = self.inputs()
+        a['threads'][0] = ledger['threads']['synthetic-thread']['windows'].copy()
+        a.update(backend_running=True, backend_detection_ok=True)
+        b['threads'][0].update(revision='wsl-after', content_revision='wsl-after-body')
+        return a,b,ledger
+
+    def check_outgoing(self, a, b, ledger, endpoint):
+        summary = preview.classify_plan(sync,a,b,ledger,60)
+        original = deepcopy((a,b,ledger,summary))
+        with tempfile.TemporaryDirectory() as folder, patch.object(sync, 'linux_mount_path', side_effect=str):
+            runtime = Path(folder)
+            result = preview.outgoing_compatibility(sync, endpoint, {}, a,b,ledger,runtime,summary)
+            self.assertEqual(list(runtime.iterdir()), [])
+        self.assertEqual((a,b,ledger,summary), original)
+        return result
+
+    def test_unmappable_outgoing_is_blocked_before_claiming_timer_will_sync(self):
+        a,b,ledger = self.outgoing_inputs()
+        endpoint = Mock()
+        endpoint.call.side_effect = [{}, {'compatible':False,'reason':'workspace_cwd_unmappable'}]
+        result = self.check_outgoing(a,b,ledger,endpoint)
+        self.assertEqual(result['reason'], 'outgoing_update_blocked')
+        self.assertEqual(result['blocked_reason_counts'], {'workspace_cwd_unmappable':1})
+        self.assertFalse(result['eligible'])
+        calls = endpoint.call.call_args_list
+        self.assertEqual([call.args[:2] for call in calls], [('wsl','export'),('windows','import-preview')])
+        self.assertEqual(calls[0].args[-2:], ('--expected', 'wsl-after'))
+
+    def test_new_outgoing_chat_checks_compatibility_without_target_replica(self):
+        a,b,ledger = self.outgoing_inputs()
+        a['threads']=[]; ledger['threads']={}
+        endpoint=Mock()
+        endpoint.call.side_effect=[{}, {'compatible':False,'reason':'workspace_cwd_unmappable'}]
+        result=self.check_outgoing(a,b,ledger,endpoint)
+        self.assertEqual(result['reason'],'outgoing_update_blocked')
+
+    def test_compatible_outgoing_still_waits_and_busy_source_is_not_exported(self):
+        a,b,ledger = self.outgoing_inputs()
+        endpoint=Mock()
+        endpoint.call.side_effect=[{}, {'compatible':True}]
+        self.assertEqual(self.check_outgoing(a,b,ledger,endpoint)['reason'],'opposite_direction_pending')
+        endpoint.reset_mock()
+        b['threads'][0]['active']=True
+        self.assertEqual(self.check_outgoing(a,b,ledger,endpoint)['reason'],'chat_busy')
+        endpoint.call.assert_not_called()
+
+    def test_metadata_only_outgoing_and_unknown_backend_do_not_export(self):
+        for unknown in (False, True):
+            a,b,ledger = self.outgoing_inputs()
+            if unknown:
+                a['backend_detection_ok']=False
+            else:
+                b['threads'][0]['content_revision']=ledger['threads']['synthetic-thread']['wsl']['content_revision']
+            endpoint=Mock()
+            self.check_outgoing(a,b,ledger,endpoint)
+            endpoint.call.assert_not_called()
+
+    def test_outgoing_compatibility_errors_never_claim_a_successful_check(self):
+        a,b,ledger = self.outgoing_inputs()
+        endpoint=Mock()
+        endpoint.call.side_effect=RuntimeError('synthetic exact-version failure')
+        with self.assertRaises(RuntimeError):
+            self.check_outgoing(a,b,ledger,endpoint)
 
     def longer_inputs(self, winning_side):
         a,b,ledger=self.inputs()

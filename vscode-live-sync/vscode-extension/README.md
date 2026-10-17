@@ -1,6 +1,12 @@
-# Codex History Sync 1.1.2
+# Codex History Sync 1.1.6
 
-Optional Remote WSL companion for Codex History Sync 2.2.2. Automatic checking is disabled until setup. When enabled, the existing extension host checks every 60 seconds; no extra Windows service is installed.
+Optional Remote WSL companion for Codex History Sync 2.3.1. Automatic checking is disabled until setup. Once configured, checks use the selected interval in the existing extension host; no extra Windows service is installed.
+
+Version 1.1.6 applies eligible outgoing WSL-to-Windows updates during a manual check. The direction-scoped controller writes only Windows, without WSL pause, acknowledgement or reload; normal target activity, exit, version, compatibility and backup guards still apply. Automatic checking keeps its configured interval. Reload the window once after a frontend upgrade to load the installed code; activation records its loaded version separately.
+
+The controller's opt-in windows_history_view_only profile receives WSL history under the original chat ID in a dedicated empty Windows directory, with a read-only runtime environment. It does not map or operate the WSL project. Full history from a viewing replica cannot overwrite the original project chat; later WSL updates can still arrive. This does not disable the official client's message composer.
+
+Version 1.1.4 checks outgoing full-record compatibility through a temporary exact-version export and the native Windows import preview. An unmappable workspace is reported as a block, rather than an indefinite timer wait. These checks never import records or stop backends, and temporary packages are removed afterward.
 
 Version 1.1.2 handles large ordinary records with ordinal or other complete header metadata without rewriting message bytes. Manual retry bypasses only the time delay; automatic backoff retains allowlisted failure counts, while all activity, confirmation and import guards remain in force.
 

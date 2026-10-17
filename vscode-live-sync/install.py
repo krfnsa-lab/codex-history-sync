@@ -113,7 +113,7 @@ def install(config_path, dry_run=False, controller_path=None):
         return
     destination.mkdir(parents=True, exist_ok=True)
     # Publish shared dependencies before entry points used by an open window.
-    for name in ('history_progress.py', 'history_merge.py', 'merge_validate.py', 'history_endpoint.py', 'merge_chat.py'):
+    for name in ('history_progress.py', 'history_windows.py', 'history_merge.py', 'merge_validate.py', 'history_endpoint.py', 'merge_chat.py'):
         atomic_copy(ROOT.parent / name, destination / name)
     atomic_copy(ROOT / 'native_local_probe.py', destination / 'native_local_probe.py')
     atomic_copy(ROOT / 'native_backend_probe.py', destination / 'native_backend_probe.py')
@@ -124,7 +124,7 @@ def install(config_path, dry_run=False, controller_path=None):
     manifest.write_text(json.dumps({'owner': OWNER, 'binary': max(native)[1]}, indent=2), encoding='utf-8')
     setup = {'windowsPython': mount(python), 'windowsController': str(controller), 'windowsConfig': str(config_path),
              'previewHelper': str(destination / 'preview_sync.py'), 'mergeHelper': str(destination / 'merge_chat.py'),
-             'intervalSeconds': 60, 'controllerTimeoutSeconds': 600,
+             'intervalSeconds': config.get('interval_minutes', 5) * 60, 'controllerTimeoutSeconds': 600,
              'progressFile': mount(runtime / 'progress.json')}
     # Native Linux owns Linux configuration and gateway files.
     script = '''import json,os,pathlib,shutil,sys

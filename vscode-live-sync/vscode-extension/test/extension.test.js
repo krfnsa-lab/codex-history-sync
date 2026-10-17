@@ -40,7 +40,7 @@ function load({ platform = 'linux', overrides = {}, pause = false, accept = true
       withProgress: async (options, callback) => { calls.push(['progress', options]); return callback({ report: event => calls.push(['progress-report', event]) }); }
     }
   };
-  const context = { extensionPath: '/preview', subscriptions: [], globalState: { get: (key, fallback) => state.has(key) ? state.get(key) : fallback, update: async (key, value) => { state.set(key, value); } } };
+  const context = { extension: {packageJSON: {version:'1.1.6'}}, extensionPath: '/preview', subscriptions: [], globalState: { get: (key, fallback) => state.has(key) ? state.get(key) : fallback, update: async (key, value) => { state.set(key, value); } } };
   const sandbox = { module: { exports: {} }, process: { platform, arch: 'x64', env: {} }, setInterval: callback => { timers.push(callback); return { unref() {} }; }, clearInterval() {}, require: name => {
     if (name === 'vscode') return vscode;
     if (name === 'node:fs') return { existsSync: value => value.endsWith('pause.json') ? pause : true };
@@ -63,6 +63,11 @@ function load({ platform = 'linux', overrides = {}, pause = false, accept = true
 }
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test('activation records the loaded frontend version separately from installation', () => {
+  const f=load();
+  assert.equal(f.state.get('loadedExtensionVersion'),'1.1.6');
+});
 
 function leaveNoticesOpen(f) {
   const pending = new Promise(() => {});

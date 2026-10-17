@@ -18,6 +18,87 @@ test('a longer WSL winner explains waiting for the desktop backend without pausi
   assert.doesNotMatch(display.text, /已同步/);
 });
 
+test('ordinary WSL updates with automatic Windows exit never instruct manual backend shutdown', () => {
+  const display = describeResult({ kind: 'waiting', reason: 'opposite_direction_pending',
+    preview: { windows_auto_exit_enabled: true, outgoing_sync_supported: true } });
+  assert.match(display.text, /等待自动同步到 Windows/);
+  assert.match(display.detail, /手动检查可立即执行/);
+  assert.match(display.detail, /WSL 窗口保持打开/);
+  assert.doesNotMatch(display.detail, /请等待 Windows Codex 空闲并停止后端/);
+  assert.doesNotMatch(display.text, /已同步/);
+});
+
+test('manual outgoing check actually transfers without a WSL pause, confirmation or reload', async t => {
+  const modes = [];
+  const f = await fixture(t, { runWindows: async (_, mode) => {
+    modes.push(mode);
+    return mode === true ? { eligible: false, reason: 'opposite_direction_pending', outgoing_sync_supported: true,
+      opposite_direction_count: 1 } : { status: 'completed', outgoing_only: true, transferred: 1,
+        blocked: [{ reason: 'source_busy' }] };
+  }, confirmReload: async () => { throw new Error('must not confirm WSL reload'); } });
+  const result = await f.coordinator.check({ manual: true });
+  assert.deepEqual(modes, [true, 'outgoing']);
+  assert.equal(result.kind, 'synced');
+  assert.ok(!f.calls.includes('prepare_pause') && !f.calls.includes('reload'));
+  await assert.rejects(fs.access(path.join(f.config.stateDir, 'pause.json')));
+  const display = describeResult(result);
+  assert.match(display.text, /已同步 1 条到 Windows/);
+  assert.match(display.detail, /另有 1 条.*未同步/);
+});
+
+test('automatic and legacy outgoing checks remain previews at the configured interval', async t => {
+  for (const manual of [false, true]) {
+    const modes = [];
+    const f = await fixture(t, { runWindows: async (_, mode) => {
+      modes.push(mode);
+      return { eligible: false, reason: 'opposite_direction_pending', outgoing_sync_supported: !manual,
+        opposite_direction_count: 1 };
+    } });
+    assert.equal((await f.coordinator.check({ manual })).kind, 'waiting');
+    assert.deepEqual(modes, [true]);
+    assert.ok(!f.calls.includes('prepare_pause') && !f.calls.includes('reload'));
+  }
+});
+
+test('manual outgoing reports actual exit blockers and never counts zero or malformed receipts as success', async t => {
+  for (const result of [
+    {status:'completed',outgoing_only:true,transferred:0,windows_exit:{reason:'windows_exit_busy'}},
+    {status:'skipped_already_running',transferred:0},
+    {status:'completed',outgoing_only:true,transferred:0,blocked:[{reason:'source_busy'}]},
+    {status:'completed',outgoing_only:false,transferred:1},
+    {status:'completed',outgoing_only:true,transferred:'1'}
+  ]) {
+    const f = await fixture(t, { runWindows: async (_, mode) => mode === true ? {
+      eligible:false,reason:'chat_busy',outgoing_sync_supported:true,opposite_direction_count:2
+    } : result });
+    if (result.outgoing_only === false || typeof result.transferred === 'string') {
+      await assert.rejects(f.coordinator.check({manual:true}), /可验证/);
+    } else {
+      const reply=await f.coordinator.check({manual:true});
+      assert.equal(reply.kind,'waiting');
+      assert.equal(reply.reason,result.windows_exit?.reason || (result.status==='skipped_already_running'?'controller_running':'chat_busy'));
+      assert.doesNotMatch(describeResult(reply).text,/\$\(check\)/);
+      if (result.windows_exit) assert.match(describeResult(reply).detail,/Windows 仍有活跃聊天任务/);
+    }
+    assert.ok(!f.calls.includes('prepare_pause') && !f.calls.includes('reload'));
+  }
+});
+
+test('an incompatible outgoing workspace reports a block rather than promising a timer sync', async t => {
+  const f = await fixture(t, { runWindows: async () => ({ eligible: false, reason: 'outgoing_update_blocked',
+    windows_auto_exit_enabled: true, blocked_reason_counts: { workspace_cwd_unmappable: 1 } }) });
+  const result = await f.coordinator.check({ manual: true });
+  assert.equal(result.kind, 'blocked');
+  assert.equal(f.calls.includes('prepare_pause'), false);
+  assert.equal(f.calls.includes('reload'), false);
+  const display = describeResult(result);
+  assert.equal(display.warning, true);
+  assert.match(display.text, /未同步，需要检查/);
+  assert.match(display.detail, /WSL 工作目录无法映射到 Windows/);
+  assert.match(display.detail, /继续等待或退出后端不能解决/);
+  assert.doesNotMatch(display.detail, /定时同步会|请等待.*停止后端/);
+});
+
 test('equal or unverifiable longer choices keep conflicts and successful choices report backups', () => {
   const conflict = describeResult({ kind: 'conflict', reason: 'chat_conflict', preview: { conflict_resolution: 'prefer_longer' } });
   assert.match(conflict.detail, /数量相同/);
@@ -613,6 +694,9 @@ test('progress-path mode is read-only and request identities are passed as exact
   const first = (await fs.readFile(capture, 'utf8')).trim().split('\n'); assert.ok(first.includes('--progress-path')); assert.ok(!first.includes('--sync-once'));
   const id = '55555555-5555-4555-8555-555555555555'; await runWindows(config, true, id);
   const second = (await fs.readFile(capture, 'utf8')).trim().split('\n'); assert.deepEqual(second.slice(-2), ['--progress-request-id', id]);
+  await runWindows(config, 'outgoing', id);
+  const outgoing=(await fs.readFile(capture,'utf8')).trim().split('\n');
+  assert.ok(outgoing.includes('--sync-outgoing-once')); assert.ok(!outgoing.includes('--sync-once'));
   await assert.rejects(runWindows(config, true, '------------------------------------'), /Invalid progress request/);
 });
 

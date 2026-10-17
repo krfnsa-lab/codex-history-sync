@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import time
 from types import SimpleNamespace
 import uuid
 
@@ -137,6 +139,7 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution
                 win[tid]['revision'] == old['windows']['revision']):
             outgoing_ids.add(tid)
     outgoing = len(outgoing_ids)
+    outgoing_busy = any(sync.is_busy(lin[tid], quiet_seconds) for tid in outgoing_ids if tid in lin)
     conflict_reasons = ('both_sides_changed', 'existing_body_difference',
                         'initial_body_difference', 'replica_missing', 'conflict_counts_equal',
                         'conflict_counts_unavailable', 'conflict_history_incomplete',
@@ -146,7 +149,7 @@ def classify_plan(sync, windows, wsl, ledger, quiet_seconds, conflict_resolution
         reason = 'existing_replica_updates'
     elif conflict_count:
         reason = 'chat_conflict'
-    elif counts.get('source_busy') or counts.get('target_busy'):
+    elif counts.get('source_busy') or counts.get('target_busy') or outgoing_busy:
         reason = 'chat_busy'
     elif any(item['source'] == 'wsl' and item.get('waiting_reason') == 'target_backend_running'
              for item in decisions):
@@ -186,6 +189,49 @@ def call_native_probe(sync, config, controller, thread_id, baseline):
     if result.returncode:
         raise RuntimeError('Native local settings verification failed')
     return json.loads(sync.decode_output(result.stdout))
+
+
+def outgoing_compatibility(sync, endpoint, config, windows, wsl, ledger, runtime, summary):
+    """Check outgoing packages without importing, stopping a backend or changing a ledger.
+
+    A planner action alone cannot prove that its historical workspace paths are
+    usable on Windows. Check the same exact-version package as the controller,
+    including new chats, rather than treating failed imports as a timer wait.
+    """
+    if summary.get('reason') not in ('opposite_direction_pending', 'chat_busy', 'longer_wsl_pending'):
+        return summary
+    if windows.get('backend_detection_ok') is not True:
+        return summary
+    relaxed = deepcopy(windows)
+    relaxed['backend_running'] = False
+    plan = preview_plan(sync, relaxed, wsl, ledger, config.get('quiet_seconds', 60),
+                        config.get('conflict_resolution', 'manual'), runtime)
+    actions = [action for action in plan['actions'] if action['source'] == 'wsl']
+    counts = {}
+    checked = 0
+    deadline = time.monotonic() + config.get('run_budget_seconds', 120)
+    for action in actions[:config.get('max_transfers_per_run', 10)]:
+        if time.monotonic() >= deadline:
+            break
+        if action['mode'] == 'metadata':
+            continue  # Metadata imports retain the native target environment.
+        with tempfile.TemporaryDirectory(prefix='outgoing-preview-', dir=runtime) as directory:
+            endpoint.call('wsl', 'export', '--id', action['id'],
+                          '--package', sync.linux_mount_path(directory), '--expected', action['source_revision'])
+            check = endpoint.call('windows', 'import-preview', '--package', directory)
+        checked += 1
+        if check.get('compatible') is not True:
+            reason = check.get('reason', 'environment_paths_unavailable')
+            counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return summary
+    result = deepcopy(summary)
+    result['reason'] = 'outgoing_update_blocked'
+    result['outgoing_preflight_checked'] = checked
+    result['blocked_reason_counts'] = {**result['blocked_reason_counts']}
+    for reason, count in counts.items():
+        result['blocked_reason_counts'][reason] = result['blocked_reason_counts'].get(reason, 0) + count
+    return result
 
 
 def virtual_local_settings_ledger(sync, windows, wsl, ledger, quiet_seconds, verify, conflict_resolution='manual', runtime=None):
@@ -313,10 +359,12 @@ def acknowledge_local_settings(sync, endpoint, config, controller, runtime, veri
     return selected
 
 
-def sync_once(controller, config_path, request_id=None):
+def sync_once(controller, config_path, request_id=None, outgoing_only=False):
     if os.name != 'nt':
         raise RuntimeError('Run this helper with native Windows Python')
     controller, sync, config, runtime = load_controller(controller, config_path)
+    if outgoing_only and not hasattr(sync, 'restrict_outgoing_plan'):
+        raise RuntimeError('The controller does not support outgoing-only synchronization')
     if not sync.wsl_running(config['wsl_distro']):
         return {'status': 'skipped_wsl_stopped', 'transferred': 0}
     if not (runtime / 'ledger.json').is_file():
@@ -329,9 +377,9 @@ def sync_once(controller, config_path, request_id=None):
         try:
             endpoint = sync.Endpoints(config, controller.parent)
             endpoint.reporter = writer
-            acknowledged = acknowledge_local_settings(sync, endpoint, config, controller, runtime)
+            acknowledged = [] if outgoing_only else acknowledge_local_settings(sync, endpoint, config, controller, runtime)
             args = SimpleNamespace(initialize=False, dry_run=False, progress_writer=writer,
-                                   progress_request_id=request_id)
+                                   progress_request_id=request_id, outgoing_only=outgoing_only)
             result = sync.execute(config, args, runtime, logging.getLogger('codex-history-sync'))
             result['local_settings_acknowledged'] = len(acknowledged)
             sync.save_run_report(runtime, result)
@@ -428,12 +476,15 @@ def _probe_locked(controller, sync, config, runtime, writer):
     virtual, proofs = virtual_local_settings_ledger(sync, windows, wsl, ledger, config.get('quiet_seconds', 60),
         lambda tid, baseline: call_native_probe(sync, config, controller, tid, baseline), config.get('conflict_resolution', 'manual'), runtime)
     summary = classify_plan(sync, windows, wsl, virtual, config.get('quiet_seconds', 60), config.get('conflict_resolution', 'manual'), runtime)
+    summary = outgoing_compatibility(sync, endpoint, config, windows, wsl, virtual, runtime, summary)
     summary['needs_reconciliation_ids'] = sorted(proofs)
     summary['local_settings_reconciliation_count'] = len(proofs)
     if family is not None:
         summary['native_backend_pid'] = family['app_server_pid']
         summary['owned_helper_count'] = family['helper_count']
     return {**summary,
+            'outgoing_sync_supported': hasattr(sync, 'restrict_outgoing_plan'),
+            'windows_auto_exit_enabled': config.get('auto_exit_windows_for_wsl_updates', False),
             'wsl_distro': config['wsl_distro'], 'runtime_directory': str(runtime),
             'operation_timeout_seconds': config.get('operation_timeout_seconds', 120),
             'run_budget_seconds': config.get('run_budget_seconds', 120),
@@ -449,12 +500,14 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--recovery-state', action='store_true')
     mode.add_argument('--sync-once', action='store_true')
+    mode.add_argument('--sync-outgoing-once', action='store_true')
     mode.add_argument('--progress-path', action='store_true')
     args = parser.parse_args()
     try:
         value = (progress_path(args.controller, args.config) if args.progress_path else
                  recovery_state(args.controller, args.config) if args.recovery_state else
                  sync_once(args.controller, args.config, args.progress_request_id) if args.sync_once else
+                 sync_once(args.controller, args.config, args.progress_request_id, outgoing_only=True) if args.sync_outgoing_once else
                  probe(args.controller, args.config, args.progress_request_id))
         code = 0
     except Exception as error:

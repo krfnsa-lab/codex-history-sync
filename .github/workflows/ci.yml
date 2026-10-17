@@ -23,6 +23,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
+      - name: Install optional compressed archive decoder
+        run: python -m pip install "backports.zstd>=1.0,<2; python_version<'3.14'"
       - name: Run isolated Python tests
         run: python -B -m unittest discover -s tests -p "test_*.py" -q
       - name: Run optional bridge Python tests
